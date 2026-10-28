@@ -11,7 +11,7 @@ Features:
       - Live status check in My Orders with auto-refund on Partial/Cancelled and conditional Refill button
   • 13 Linked Active SMM Services (Instagram, TikTok, Facebook, YouTube) — all average time 2-6 hours
   • Referral System: 10% bonus on referred user's COMPLETED order amount only (never on join; shown only in Refer menu)
-  • Manual bKash Personal Send Money Deposit (Paid File bot style) with 10-digit TrxID & 1-Click Admin Approve/Reject
+  • Manual bKash/Nagad/Rocket Personal Send Money Deposit (Paid File bot style, method first) with TrxID duplicate check & 1-Click Admin Approve/Reject
   • 100% Hidden Admin Panel (ONLY visible to ADMIN_ID):
       - Live SMM Panel API Balance & Profit Checking (Panel Cost vs Sell Price)
       - Add / Edit SMM Service (service name, panel_service_id, panel rate, sell price, Min, Max, refill)
@@ -725,7 +725,7 @@ ACTIVE_13_SERVICES = [
         "Instagram Followers",
         "smm",
         600.0,
-        0,
+        10,
         500000,
         "⏱️ Average time: 2-6 hours | 🔄 LifeTime refill | Drop may happen, refill only if panel provides it.",
         None,
@@ -742,7 +742,7 @@ ACTIVE_13_SERVICES = [
         "Instagram Likes",
         "smm",
         30.0,
-        0,
+        10,
         1000000,
         "⏱️ Average time: 2-6 hours | 🔄 LifeTime refill | Drop may happen, refill only if panel provides it.",
         None,
@@ -776,7 +776,7 @@ ACTIVE_13_SERVICES = [
         "Instagram Impression",
         "smm",
         15.0,
-        0,
+        10,
         1000000,
         "⏱️ Average time: 2-6 hours | 🚫 No Refill.",
         None,
@@ -794,7 +794,7 @@ ACTIVE_13_SERVICES = [
         "TikTok Followers",
         "smm",
         180.0,
-        0,
+        10,
         100000,
         "⏱️ Average time: 2-6 hours | 🚫 No Refill.",
         None,
@@ -898,7 +898,7 @@ ACTIVE_13_SERVICES = [
         "smm",
         10.0,
         100,
-        0,  # Max not listed -> editable in Admin
+        1000000000,
         "⏱️ Average time: 2-6 hours | 🔄 REFILL 365D | Drop may happen, refill only if panel provides it.",
         None,
         7213,
@@ -1271,13 +1271,36 @@ def format_user_service_block(s: sqlite3.Row) -> str:
 
     lines = [
         f"{platform_emoji_for(s['category'])} <b>{s['name']}</b>",
-        f"💰 <b>মূল্য:</b> ৳{sell_str} / 1000",
+        f"💰 <b>মূল্য:</b> {format_price_1k_plain(s['name'], sell_str)}",
         f"🔄 <b>রিফিল:</b> {refill_txt}",
     ]
     if limit_parts:
         lines.append(f"📊 <b>লিমিট:</b> {' | '.join(limit_parts)}")
     lines.append(f"⏱️ <b>Average time:</b> {avg_t}")
     return "\n".join(lines)
+
+
+def service_price_unit(name: str) -> str:
+    """Plain unit word for the user-facing '1000 <Unit> <price> Taka' format."""
+    n = (name or "").lower()
+    if "reaction" in n:
+        return "Reaction"
+    if "followers" in n:
+        return "Followers"
+    if "likes" in n:
+        return "Likes"
+    if "views" in n:
+        return "Views"
+    if "shares" in n:
+        return "Shares"
+    if "impression" in n:
+        return "Impression"
+    return "Units"
+
+
+def format_price_1k_plain(name: str, sell_str: str) -> str:
+    """User-facing per-1000 price, e.g. '1000 Likes 30 Taka' (no ৳, no '=')."""
+    return f"1000 {service_price_unit(name)} {sell_str} Taka"
 
 
 def platform_emoji_for(category: str) -> str:
@@ -1300,13 +1323,13 @@ def build_single_column_service_buttons(
 ) -> InlineKeyboardMarkup:
     """
     Builds single-column inline buttons (one service per row) with text:
-    "TikTok Followers — ৳180/1K"
+    "TikTok Followers — 1000 Followers 180 Taka"
     """
     rows = []
     for s in services:
         sell_str = _fmt_num(get_sell_rate_per_1k(s))
         # Button text cannot be bold in Telegram, so emoji + price carry the look.
-        btn_text = f"{platform_emoji_for(s['category'])} {s['name']} • ৳{sell_str} / 1000"
+        btn_text = f"{platform_emoji_for(s['category'])} {s['name']} • {format_price_1k_plain(s['name'], sell_str)}"
         rows.append([InlineKeyboardButton(btn_text, callback_data=f"srv_{s['id']}")])
     if include_back_to_cats:
         rows.append(
@@ -1665,6 +1688,11 @@ def deposit_enabled_methods() -> list:
     return [k for k in DEPOSIT_METHODS if deposit_method_enabled(k)]
 
 
+def deposit_available_methods() -> list:
+    """Paid File available_methods(): enabled AND a number is set (setting or env)."""
+    return [k for k in deposit_enabled_methods() if deposit_method_number(k)]
+
+
 def deposit_method_label(key: str) -> str:
     return DEPOSIT_METHODS.get(key, DEPOSIT_METHODS["bkash"])[2]
 
@@ -1681,6 +1709,50 @@ def deposit_method_text(key: str) -> str:
     if num:
         return f"{emoji} <b>{label}:</b> <code>{num}</code>"
     return f"{emoji} <b>{label}:</b> অ্যাডমিন প্যানেল থেকে নাম্বার সেট করুন।"
+
+
+
+_METHOD_BN = {
+    "bkash": ("🌸", "বিকাশ"),
+    "nagad": ("🧡", "নগদ"),
+    "rocket": ("💜", "রকেট"),
+}
+
+
+def deposit_method_bn(key: str) -> str:
+    """Bangla method name (Paid File style)."""
+    return _METHOD_BN.get(key, _METHOD_BN["bkash"])[1]
+
+
+def deposit_method_instructions(key: str, amt: float) -> str:
+    """Paid File style: chosen method number + Send Money (Personal) rules + divider + TrxID prompt."""
+    emoji, bn = _METHOD_BN.get(key, _METHOD_BN["bkash"])
+    return (
+        f"{emoji} <b>{bn} পার্সোনাল ডিপোজিট (Send Money)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 <b>ডিপোজিট পরিমাণ:</b> ৳{amt:.2f}\n"
+        f"{deposit_method_text(key)}\n\n"
+        "📌 <b>পেমেন্ট করার নিয়ম:</b>\n"
+        f"১. উপরের নম্বরে ঠিক ৳{amt:.2f} Send Money করুন।\n"
+        "২. সেন্ড মানি সফল হলে প্রাপ্ত মেসেজ থেকে TrxID কপি করুন।\n"
+        "৩. নিচে আপনার TrxID টি লিখে পাঠিয়ে দিন।\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ টাকা পাঠানোর পর অ্যাডমিন ম্যানুয়ালি যাচাই করে ব্যালেন্স যোগ করে দেবে!\n\n"
+        f"দয়া করে আপনার {bn} এর TrxID টি নিচে লিখে পাঠান:"
+    )
+
+
+def is_trxid_used(trxid: str) -> bool:
+    """Duplicate TrxID check (Paid File style): a TrxID counts as used unless its earlier request was rejected."""
+    try:
+        with _db_lock, db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM balance_requests WHERE trxid = ? AND status != 'rejected' LIMIT 1",
+                (trxid.strip().upper(),),
+            ).fetchone()
+        return row is not None
+    except Exception:
+        return False
 
 
 def get_refer_bonus_pct() -> float:
@@ -1862,7 +1934,7 @@ async def show_all_services_list(update: Update, context: ContextTypes.DEFAULT_T
     - One service per block, blank line between services.
     - Normal users see ONLY: service name, sell price, refill, Min, Max, average time 2-6 hours.
     - Never shows panel rate, profit, or panel ID.
-    - Single-column service buttons: one service per row, text = "TikTok Followers — ৳180/1K".
+    - Single-column service buttons: one service per row, text = "TikTok Followers — 1000 Followers 180 Taka".
     - Does NOT repeat the 4 platform buttons under the service list.
     """
     user_id = update.effective_user.id
@@ -1877,6 +1949,7 @@ async def show_all_services_list(update: Update, context: ContextTypes.DEFAULT_T
         "📋 <b>𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📋 <b>সার্ভিস লিস্ট</b>\n"
+        "💰 দাম প্রতি ১০০০টির জন্য হিসাব করা হয়\n"
         "⏱️ <b>Average time:</b> 2-6 hours"
     ]
     current_cat = None
@@ -1984,6 +2057,7 @@ async def handle_category_And_service_cb(
             "🚀 <b>𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>{cat_name} — ধাপ ২/৫: সার্ভিস বাছুন</b>\n"
+            "💰 দাম প্রতি ১০০০টির জন্য হিসাব করা হয়\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             + "\n\n".join(service_blocks)
             + "\n\n━━━━━━━━━━━━━━━━━━━━━━\n👇 অর্ডার করতে নিচের সার্ভিস বাটনে চাপুন:"
@@ -2050,7 +2124,7 @@ async def handle_category_And_service_cb(
         text = (
             f"{platform_emoji_for(s['category'])} <b>{s['name']}</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 <b>মূল্য:</b> <b>৳{sell_str} / 1000</b>\n"
+            f"💰 <b>মূল্য:</b> <b>{format_price_1k_plain(s['name'], sell_str)}</b>\n"
             f"🔄 <b>রিফিল:</b> {refill_txt}\n"
             f"{limit_line}"
             f"⏱️ <b>Average time:</b> {avg_t}\n"
@@ -2587,32 +2661,55 @@ async def handle_user_order_actions_cb(
 
 # ---------------------------------------------------------------------------
 # 4. DEPOSIT FLOW — Clean 5 Steps:
-#    1) Amount -> 2) bKash Personal Send Money -> 3) TrxID -> 4) Submit for Admin Approval -> 5) Clear Confirmation
+#    1) Method -> 2) Amount (limit 10-50000) -> 3) Number + Send Money instructions -> 4) TrxID (duplicate check) -> 5) Submit for Admin Approval -> 6) Pending Confirmation
 # ---------------------------------------------------------------------------
 async def start_deposit_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Paid File style, Step 1 = method selection (only enabled methods; deposit closed if none)."""
     context.user_data.clear()
-    context.user_data["state"] = ST_DEP_AMOUNT
+    context.user_data["state"] = ST_DEP_METHOD
     context.user_data["dep_method_key"] = ""
     context.user_data["dep_method"] = ""
+    enabled = deposit_available_methods()
+    if not enabled:
+        closed_text = "⚠️ বর্তমানে ডিপোজিট বন্ধ আছে। সাহায্যের জন্য Support-এ যোগাযোগ করুন।"
+        if update.message:
+            await update.message.reply_text(closed_text, reply_markup=main_menu(update.effective_user.id))
+        elif update.callback_query:
+            await update.callback_query.answer()
+            await context.bot.send_message(
+                chat_id=update.callback_query.from_user.id,
+                text=closed_text,
+                reply_markup=main_menu(update.callback_query.from_user.id),
+            )
+        context.user_data.clear()
+        return
+    method_lines = []
+    for _k in enabled:
+        _emoji, _bn = _METHOD_BN.get(_k, _METHOD_BN["bkash"])
+        method_lines.append(f"{_emoji} {_bn} (পার্সোনাল Send Money)")
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"{DEPOSIT_METHODS[k][0]} {DEPOSIT_METHODS[k][1]}", callback_data=f"dep_m_{k}")]
+            for k in enabled
+        ]
+        + [[InlineKeyboardButton("❌ বাতিল করুন", callback_data="dep_cancel_cb")]]
+    )
     text = (
         "💰 <b>ডিপোজিট — 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
-        "─────────\n"
-        "💵 <b>ধাপ ১: টাকার পরিমাণ (Amount)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💳 <b>ধাপ ১: ডিপোজিট মেথড বাছুন</b>\n"
         "💰 <b>ডিপোজিট লিমিট: মিনিমাম ৳10 - ম্যাক্সিমাম ৳50000</b>\n"
-        "আপনি কত টাকা ডিপোজিট করতে চান? নিচে সংখ্যায় লিখুন (যেমন: <code>100</code>):"
+        "আমাদের পার্সোনাল নাম্বারে Send Money করুন। অ্যাডমিন ম্যানুয়ালি যাচাই করে ব্যালেন্স যোগ করে দেবে:\n\n"
+        + "\n".join(method_lines)
+        + "\n━━━━━━━━━━━━━━━━━━━━━━\n👇 পছন্দের মাধ্যম বাছুন:"
     )
     if update.message:
-        await update.message.reply_text(
-            text, parse_mode="HTML", reply_markup=cancel_menu()
-        )
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
     elif update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text, parse_mode="HTML")
-        await context.bot.send_message(
-            chat_id=update.callback_query.from_user.id,
-            text="💵 টাকার পরিমাণ লিখুন (বাতিল করতে ❌ বাতিল করুন চাপুন):",
-            reply_markup=cancel_menu(),
-        )
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+
+
 
 
 async def _finalize_deposit_submission(
@@ -2642,6 +2739,7 @@ async def _finalize_deposit_submission(
         f"💰 <b>পরিমাণ:</b> <b>৳{amt:.2f}</b>\n"
         f"🔢 <b>TrxID:</b> <code>{trxid}</code>\n"
         "⏳ <b>স্ট্যাটাস:</b> Pending - admin approval er por balance jog hobe\n"
+        "আপনার রিকোয়েস্টটি ইতিমধ্যে অ্যাডমিনের কাছে চলে গেছে, তাই সাপোর্টে আলাদা মেসেজ করার প্রয়োজন নেই। ধৈর্য ধরে অপেক্ষা করুন!\n"
         "─────────\n"
         "অ্যাডমিন আপনার পেমেন্ট যাচাই করে অ্যাপ্রুভ করার সাথে সাথে ওয়ালেটে ব্যালেন্স যোগ হয়ে যাবে।"
     )
@@ -2709,6 +2807,16 @@ async def handle_deposit_method_cb(
         if amt <= 0 or not trxid:
             await query.edit_message_text("⚠️ ডিপোজিট তথ্য অসম্পূর্ণ। আবার চেষ্টা করুন।")
             return
+        if is_trxid_used(trxid):
+            await query.edit_message_text(
+                "⚠️ এই TrxID আগেই ব্যবহার হয়েছে। অনুগ্রহ করে সঠিক/নতুন TrxID দিন। আবার 💰 ডিপোজিট বাটনে চাপুন।"
+            )
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="👇 আপনার মেইন মেনু:",
+                reply_markup=main_menu(user.id),
+            )
+            return
         _, confirm_text = await _finalize_deposit_submission(
             user, method, amt, trxid, context
         )
@@ -2720,34 +2828,42 @@ async def handle_deposit_method_cb(
         )
         return
 
-    # Deposit method selection (bKash / Nagad / Rocket, Paid File bot style).
+    # Deposit method selection (Paid File style): method first, then amount.
     if data.startswith("dep_m_"):
         method_key = data[len("dep_m_"):]
         if method_key not in DEPOSIT_METHODS or not deposit_method_enabled(method_key):
             await query.edit_message_text("❌ এই মেথডটি বর্তমানে বন্ধ আছে। অন্য মেথড বাছুন।")
             return
-        amt = float(context.user_data.get("dep_amount", 0.0) or 0.0)
-        if amt <= 0:
-            await query.edit_message_text("⚠️ ডিপোজিট সেশনটির মেয়াদ শেষ হয়েছে। অনুগ্রহ করে আবার 💰 ডিপোজিট বাটনে চাপুন।")
+        if not deposit_method_number(method_key):
+            _kb2 = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(f"{DEPOSIT_METHODS[k][0]} {DEPOSIT_METHODS[k][1]}", callback_data=f"dep_m_{k}")]
+                    for k in deposit_available_methods()
+                ]
+                + [[InlineKeyboardButton("❌ বাতিল করুন", callback_data="dep_cancel_cb")]]
+            )
+            await query.edit_message_text(
+                "❌ এই মাধ্যমটি বর্তমানে চালু নেই। অন্য একটি বেছে নিন।",
+                reply_markup=_kb2,
+            )
             return
         method = deposit_method_label(method_key)
         context.user_data["dep_method_key"] = method_key
         context.user_data["dep_method"] = method
-        context.user_data["state"] = ST_DEP_TRXID
-        if method_key == "bkash":
-            trxid_line = "১) উপরের নাম্বারে Send Money করুন। ২) পেমেন্ট মেসেজ থেকে ১০ সংখ্যার/অক্ষরের TrxID কপি করুন। ৩) সেই TrxID নিচে লিখে পাঠান:"
-        else:
-            trxid_line = "১) উপরের নাম্বারে Send Money করুন। ২) পেমেন্ট মেসেজ থেকে TrxID কপি করুন। ৩) সেই TrxID নিচে লিখে পাঠান:"
+        context.user_data["state"] = ST_DEP_AMOUNT
         await query.edit_message_text(
-            f"💰 <b>ডিপোজিট অ্যামাউন্ট: ৳{amt:.2f}</b>\n"
-            "─────────\n"
-            f"💳 <b>ধাপ ২: {method}</b>\n"
-            f"নিচের নাম্বারে <b>৳{amt:.2f}</b> টাকা <b>Send Money</b> করুন:\n"
-            f"{deposit_method_text(method_key)}\n"
-            "─────────\n"
-            "🔢 <b>ধাপ ৩: Transaction ID (TrxID)</b>\n"
-            f"{trxid_line}",
+            "💰 <b>ডিপোজিট — 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💳 <b>ধাপ ১: {method} বাছা হয়েছে</b>\n"
+            "💵 <b>ধাপ ২: টাকার পরিমাণ (Amount)</b>\n"
+            "💰 <b>ডিপোজিট লিমিট: মিনিমাম ৳10 - ম্যাক্সিমাম ৳50000</b>\n"
+            "আপনি কত টাকা ডিপোজিট করতে চান? নিচে সংখ্যায় লিখুন (যেমন: <code>100</code>):",
             parse_mode="HTML",
+        )
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="💵 টাকার পরিমাণ লিখুন (বাতিল করতে ❌ বাতিল করুন চাপুন):",
+            reply_markup=cancel_menu(),
         )
         return
 
@@ -3693,14 +3809,13 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ বাতিল করা হয়েছে।", reply_markup=markup)
         return True
 
-    # Deposit method selection: user must tap a method button, not type.
+    # Deposit method selection (Paid File style, Step 1): user must tap a method button, not type.
     if state == ST_DEP_METHOD:
-        _amt = float(context.user_data.get("dep_amount", 0.0) or 0.0)
-        _enabled = deposit_enabled_methods()
+        _enabled = deposit_available_methods()
         if not _enabled:
             await update.message.reply_text(
-                "❌ বর্তমানে ডিপোজিট বন্ধ আছে। অ্যাডমিনের সাথে যোগাযোগ করুন.",
-                reply_markup=cancel_menu(),
+                "⚠️ বর্তমানে ডিপোজিট বন্ধ আছে। সাহায্যের জন্য Support-এ যোগাযোগ করুন।",
+                reply_markup=main_menu(user.id),
             )
             return True
         _kb = InlineKeyboardMarkup(
@@ -3711,9 +3826,10 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
             + [[InlineKeyboardButton("❌ বাতিল করুন", callback_data="dep_cancel_cb")]]
         )
         await update.message.reply_text(
-            f"💰 <b>ডিপোজিট অ্যামাউন্ট: ৳{_amt:.2f}</b>\n"
-            "─────────\n"
-            "💳 <b>ধাপ ২: ডিপোজিট মেথড বাছুন</b>\n"
+            "💰 <b>ডিপোজিট — 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💳 <b>ধাপ ১: ডিপোজিট মেথড বাছুন</b>\n"
+            "💰 <b>ডিপোজিট লিমিট: মিনিমাম ৳10 - ম্যাক্সিমাম ৳50000</b>\n"
             "নিচের বাটন থেকে একটি মেথড বাছুন (bKash / Nagad / Rocket):",
             parse_mode="HTML",
             reply_markup=_kb,
@@ -3751,7 +3867,7 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
             f"{platform_emoji_for(s['category'])} <b>{s['name']}</b>\n"
             f"🔢 <b>ধাপ ৪/৫: পরিমাণ (Quantity)</b> কত নিতে চান?\n"
             f"📊 লিমিট: <b>{mm_txt}</b>\n"
-            f"💰 মূল্য: <b>৳{_fmt_num(sell_rate)} / 1000</b>\n"
+            f"💰 মূল্য: <b>{format_price_1k_plain(s['name'], _fmt_num(sell_rate))}</b>\n"
             f"⏱️ Average time: <b>{get_avg_time_label(s)}</b>\n\n"
             "শুধু সংখ্যায় লিখুন (যেমন: <code>1000</code>):",
             parse_mode="HTML",
@@ -3833,7 +3949,7 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
             f"🔄 <b>রিফিল:</b> {get_refill_label(s)}\n"
             f"⏱️ <b>Average time:</b> {get_avg_time_label(s)}\n"
             "💰 <b>মূল্য হিসাব:</b>\n"
-            f"💰 <b>মূল্য (প্রতি ১০০০):</b> ৳{_fmt_num(sell_rate)}\n"
+            f"💰 <b>মূল্য:</b> {format_price_1k_plain(s['name'], _fmt_num(sell_rate))}\n"
             f"💵 <b>Original price:</b> ৳{original_price:.2f}\n"
             f"🎁 <b>VIP Discount:</b> {disc_pct}%\n"
             f"💳 <b>Final price:</b> <b>৳{final_price:.2f}</b>\n"
@@ -3844,7 +3960,7 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return True
 
-    # Deposit Step 1 -> Show Step 2 (bKash Personal Send Money) & Ask Step 3 (TrxID)
+    # Deposit Step 2 (Paid File style): amount -> show chosen method number + Send Money instructions -> ask TrxID.
     if state == ST_DEP_AMOUNT:
         try:
             amt = float(text)
@@ -3856,34 +3972,36 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=cancel_menu(),
             )
             return True
-        context.user_data["dep_amount"] = round(amt, 2)
-        context.user_data["state"] = ST_DEP_METHOD
-        enabled = deposit_enabled_methods()
-        if not enabled:
+        _mkey = str(context.user_data.get("dep_method_key") or "")
+        if _mkey not in DEPOSIT_METHODS:
+            context.user_data["state"] = ST_DEP_METHOD
+            _enabled2 = deposit_available_methods()
+            _kb2 = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(f"{DEPOSIT_METHODS[k][0]} {DEPOSIT_METHODS[k][1]}", callback_data=f"dep_m_{k}")]
+                    for k in _enabled2
+                ]
+                + [[InlineKeyboardButton("❌ বাতিল করুন", callback_data="dep_cancel_cb")]]
+            )
             await update.message.reply_text(
-                "❌ বর্তমানে ডিপোজিট বন্ধ আছে। অ্যাডমিনের সাথে যোগাযোগ করুন।",
+                "💳 <b>ধাপ ১: ডিপোজিট মেথড বাছুন</b>\n"
+                "নিচের বাটন থেকে একটি মেথড বাছুন (bKash / Nagad / Rocket):",
+                parse_mode="HTML",
+                reply_markup=_kb2,
+            )
+            return True
+        if not deposit_method_number(_mkey):
+            await update.message.reply_text(
+                "❌ এই মাধ্যমটি বর্তমানে চালু নেই। অন্য একটি বেছে নিন।",
                 reply_markup=cancel_menu(),
             )
             return True
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        f"{DEPOSIT_METHODS[k][0]} {DEPOSIT_METHODS[k][1]}",
-                        callback_data=f"dep_m_{k}",
-                    )
-                ]
-                for k in enabled
-            ]
-            + [[InlineKeyboardButton("❌ বাতিল করুন", callback_data="dep_cancel_cb")]]
-        )
+        context.user_data["dep_amount"] = round(amt, 2)
+        context.user_data["state"] = ST_DEP_TRXID
         await update.message.reply_text(
-            f"💰 <b>ডিপোজিট অ্যামাউন্ট: ৳{amt:.2f}</b>\n"
-            "─────────\n"
-            "💳 <b>ধাপ ২: ডিপোজিট মেথড বাছুন</b>\n"
-            "নিচে থেকে একটি মেথড বাছুন (bKash / Nagad / Rocket):",
+            deposit_method_instructions(_mkey, amt),
             parse_mode="HTML",
-            reply_markup=kb,
+            reply_markup=cancel_menu(),
         )
         return True
 
@@ -3915,6 +4033,12 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
                     reply_markup=cancel_menu(),
                 )
                 return True
+        if is_trxid_used(trxid):
+            await update.message.reply_text(
+                "⚠️ এই TrxID আগেই ব্যবহার হয়েছে। অনুগ্রহ করে সঠিক/নতুন TrxID দিন, অথবা ❌ বাতিল করুন চাপুন।",
+                reply_markup=cancel_menu(),
+            )
+            return True
         context.user_data["dep_trxid"] = trxid
         context.user_data["state"] = ST_DEP_SUBMIT
         kb = InlineKeyboardMarkup(
