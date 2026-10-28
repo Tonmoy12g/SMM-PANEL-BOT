@@ -1,2 +1,5 @@
 Flask
 python-telegram-bot
+requests
+gspread
+google-auth

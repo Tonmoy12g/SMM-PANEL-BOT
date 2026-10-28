@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-👑 VIP BIG SMM PANEL & DIGITAL STORE BOT — Pro Edition
-======================================================
+👑 VIP BIG SMM PANEL BOT — Final Production Edition
+====================================================
 Features:
   • Colored ReplyKeyboard Buttons (Primary Blue, Success Green, Danger Red — Telegram Bot API 9.4+ compatible)
-  • Complete SMM Panel Flow: Category -> Service -> Target Link -> Quantity -> Auto Cost Calculation (per 1K) -> Instant Wallet Deduction
-  • Pre-loaded VIP SMM Services (Facebook, TikTok, YouTube, Instagram, Telegram) + Instant Digital File Products
+  • Real SMM Panel API Integration (SMM_API_URL & SMM_API_KEY from environment variables only):
+      - panel_balance(), panel_add_order(), panel_status(), panel_refill()
+      - Platform URL validation, Min/Max validation, Confirm/Cancel step, user & panel balance verification
+      - Live status check in My Orders with auto-refund on Partial/Cancelled and conditional Refill button
+  • 13 Linked Active SMM Services (Instagram, TikTok, Facebook, YouTube) — all average time 2-6 hours
+  • Referral System: 10% bonus on referred user's COMPLETED order amount only (never on join; shown only in Refer menu)
   • Multi-Method Wallet Deposit (bKash, Nagad, Rocket, Binance) with TrxID & 1-Click Admin Approve/Reject
-  • Live Order Tracking (Pending, Processing, Completed, Cancelled + Auto Wallet Refund)
-  • User Profile, VIP Rank System, Refer & Earn, Top Leaderboard, Daily Bonus & Missions, Support Ticket
   • 100% Hidden Admin Panel (ONLY visible to ADMIN_ID):
-      - Add SMM Service or Digital File Product
-      - Delete Service, View Pending Orders & Pending Deposits
-      - Add / Deduct User Balance
-      - Set bKash, Nagad, Rocket, Binance, Support Username, Refer Bonus, Daily Bonus
-      - Broadcast Message to All Users & Live Bot Statistics
+      - Live SMM Panel API Balance & Profit Checking (Panel Cost vs Sell Price)
+      - Add / Edit SMM Service (service name, panel_service_id, panel rate, sell price, Min, Max, refill)
+      - Admin "All Users" View & 1-Click CSV Export (user ID, username, name, wallet balance, total orders, join date)
+      - View Orders (with panel_order_id, Check Panel Status, Refund Order), Manage Balances, Payments & Broadcast
+  • Free Google Sheets Live Backup (on every new user, balance change, and order via env vars GOOGLE_SHEET_ID & GOOGLE_SERVICE_ACCOUNT_JSON)
   • Built-in Flask Keep-Alive Server (/ and /ping) + Mini App API (/api/balance, /api/services, /download/<id>) for Render
 """
 
+import base64
+import csv
+import io
 import json
 import logging
 import os
-import re
 import sqlite3
 import threading
 import time
@@ -30,6 +34,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
+import requests
 from flask import Flask, Response, jsonify, request
 from telegram import (
     InlineKeyboardButton,
@@ -48,11 +53,27 @@ from telegram.ext import (
     filters,
 )
 
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials as ServiceAccountCredentials
+except ImportError:
+    gspread = None
+    ServiceAccountCredentials = None
+
+try:
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google.oauth2 import service_account as google_service_account
+except ImportError:
+    GoogleAuthRequest = None
+    google_service_account = None
+
 # ---------------------------------------------------------------------------
 # Configuration & Logging
 # ---------------------------------------------------------------------------
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vip_smm_bot.db")
 _db_lock = threading.Lock()
+_sheets_lock = threading.Lock()
+_sheets_warned_unconfigured = False
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -72,6 +93,502 @@ def _admin_id() -> int:
 def is_admin(user_id: int) -> bool:
     aid = _admin_id()
     return aid != 0 and int(user_id) == aid
+
+
+def _fmt_num(val: float) -> str:
+    """Formats a rate or price cleanly without losing decimal precision (e.g. 1.13, 2.25, 600)."""
+    rounded = round(float(val), 4)
+    if rounded == int(rounded):
+        return str(int(rounded))
+    text = f"{rounded:.4f}".rstrip("0").rstrip(".")
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Google Sheets Backup (Free, Environment Variables Only, Non-Blocking)
+# ---------------------------------------------------------------------------
+def _get_google_sheets_config() -> tuple[str, str]:
+    """
+    Reads Google Sheet ID and Service Account JSON/path strictly from environment variables.
+    Supported env vars:
+      - GOOGLE_SHEET_ID (or SHEET_ID)
+      - GOOGLE_SERVICE_ACCOUNT_JSON (or GOOGLE_CREDENTIALS_JSON / GOOGLE_APPLICATION_CREDENTIALS)
+    """
+    sheet_id = (
+        os.environ.get("GOOGLE_SHEET_ID", "").strip()
+        or os.environ.get("SHEET_ID", "").strip()
+    )
+    creds_raw = (
+        os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+        or os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+        or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    )
+    return sheet_id, creds_raw
+
+
+def _load_service_account_info(creds_raw: str) -> dict | None:
+    """Parses service account credentials from JSON string, base64 string, or file path in env var."""
+    if not creds_raw:
+        return None
+    if creds_raw.startswith("{"):
+        try:
+            return json.loads(creds_raw)
+        except Exception:
+            return None
+    if os.path.isfile(creds_raw):
+        try:
+            with open(creds_raw, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+    try:
+        decoded = base64.b64decode(creds_raw).decode("utf-8")
+        if decoded.strip().startswith("{"):
+            return json.loads(decoded)
+    except Exception:
+        pass
+    return None
+
+
+def _sync_write_or_update_sheet(
+    user_id: int,
+    username: str,
+    balance: float,
+    order_details: str,
+    row_key: str = "",
+) -> None:
+    """
+    Writes or updates one row in Google Sheet with columns:
+    [User ID, Username, Balance, Order Details, Date/Time]
+    If Sheets is not configured, logs a warning and returns without error.
+    """
+    global _sheets_warned_unconfigured
+    sheet_id, creds_raw = _get_google_sheets_config()
+    if not sheet_id or not creds_raw:
+        if not _sheets_warned_unconfigured:
+            logger.warning(
+                "Google Sheets backup is not configured (GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON missing). Skipping backup."
+            )
+            _sheets_warned_unconfigured = True
+        return
+
+    sa_info = _load_service_account_info(creds_raw)
+    if not sa_info:
+        logger.warning("Google Sheets credentials could not be parsed. Skipping backup.")
+        return
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    uname_clean = f"@{username.lstrip('@')}" if username else "-"
+    bal_str = f"{float(balance):.2f}"
+    uid_str = str(user_id)
+    details_str = order_details or "Account Active"
+    row_values = [uid_str, uname_clean, bal_str, details_str, now_str]
+    headers = ["User ID", "Username", "Balance", "Order Details", "Date/Time"]
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+
+    with _sheets_lock:
+        # Path 1: gspread if installed
+        if gspread is not None and ServiceAccountCredentials is not None:
+            try:
+                creds = ServiceAccountCredentials.from_service_account_info(
+                    sa_info, scopes=scopes
+                )
+                client = gspread.authorize(creds)
+                sh = client.open_by_key(sheet_id)
+                ws = sh.sheet1
+                all_rows = ws.get_all_values()
+                if not all_rows:
+                    ws.append_row(headers, value_input_option="USER_ENTERED")
+                    all_rows = [headers]
+
+                target_row_idx = None
+                for idx, r in enumerate(all_rows[1:], start=2):
+                    if not r:
+                        continue
+                    r_uid = str(r[0]).strip() if len(r) > 0 else ""
+                    r_det = str(r[3]).strip() if len(r) > 3 else ""
+                    if row_key and row_key in r_det:
+                        target_row_idx = idx
+                        break
+                    if not row_key and r_uid == uid_str and not r_det.startswith("#SMM-"):
+                        target_row_idx = idx
+                        break
+
+                if target_row_idx is not None:
+                    ws.update(
+                        f"A{target_row_idx}:E{target_row_idx}",
+                        [row_values],
+                        value_input_option="USER_ENTERED",
+                    )
+                else:
+                    ws.append_row(row_values, value_input_option="USER_ENTERED")
+                return
+            except Exception as exc:
+                logger.warning("Google Sheets backup error (gspread): %s", exc.__class__.__name__)
+                return
+
+        # Path 2: google-auth + requests REST fallback
+        if google_service_account is not None and GoogleAuthRequest is not None:
+            try:
+                creds = google_service_account.Credentials.from_service_account_info(
+                    sa_info, scopes=scopes
+                )
+                creds.refresh(GoogleAuthRequest())
+                auth_headers = {
+                    "Authorization": f"Bearer {creds.token}",
+                    "Content-Type": "application/json",
+                }
+                base_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
+                get_resp = requests.get(
+                    f"{base_url}/values/A1:E5000", headers=auth_headers, timeout=15
+                )
+                all_rows = []
+                if get_resp.status_code == 200:
+                    all_rows = get_resp.json().get("values", [])
+
+                if not all_rows:
+                    requests.post(
+                        f"{base_url}/values/A1:E1:append?valueInputOption=USER_ENTERED",
+                        headers=auth_headers,
+                        json={"values": [headers]},
+                        timeout=15,
+                    )
+                    all_rows = [headers]
+
+                target_row_idx = None
+                for idx, r in enumerate(all_rows[1:], start=2):
+                    if not r:
+                        continue
+                    r_uid = str(r[0]).strip() if len(r) > 0 else ""
+                    r_det = str(r[3]).strip() if len(r) > 3 else ""
+                    if row_key and row_key in r_det:
+                        target_row_idx = idx
+                        break
+                    if not row_key and r_uid == uid_str and not r_det.startswith("#SMM-"):
+                        target_row_idx = idx
+                        break
+
+                if target_row_idx is not None:
+                    requests.put(
+                        f"{base_url}/values/A{target_row_idx}:E{target_row_idx}?valueInputOption=USER_ENTERED",
+                        headers=auth_headers,
+                        json={"values": [row_values]},
+                        timeout=15,
+                    )
+                else:
+                    requests.post(
+                        f"{base_url}/values/A1:E1:append?valueInputOption=USER_ENTERED",
+                        headers=auth_headers,
+                        json={"values": [row_values]},
+                        timeout=15,
+                    )
+            except Exception as exc:
+                logger.warning("Google Sheets REST backup error: %s", exc.__class__.__name__)
+        else:
+            logger.warning(
+                "gspread/google-auth libraries not installed; skipping Google Sheets backup."
+            )
+
+
+def schedule_sheet_backup(
+    user_id: int,
+    username: str = "",
+    balance: float | None = None,
+    order_details: str = "",
+    row_key: str = "",
+) -> None:
+    """Schedules a non-blocking Google Sheet write/update in a background daemon thread."""
+    try:
+        if not username or balance is None:
+            with _db_lock, db() as conn:
+                u = conn.execute(
+                    "SELECT username, first_name, balance FROM users WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()
+                if u:
+                    if not username:
+                        username = u["username"] or u["first_name"] or ""
+                    if balance is None:
+                        balance = float(u["balance"] or 0.0)
+                if not order_details:
+                    last_o = conn.execute(
+                        "SELECT id, service_name, quantity, sell_price, status FROM orders WHERE buyer_id = ? ORDER BY id DESC LIMIT 1",
+                        (user_id,),
+                    ).fetchone()
+                    if last_o:
+                        order_details = (
+                            f"Last Order #SMM-{last_o['id']}: {last_o['service_name']} "
+                            f"(Qty: {last_o['quantity']}, ৳{last_o['sell_price']:.2f}, {last_o['status']})"
+                        )
+                    else:
+                        order_details = "User Wallet / No Orders Yet"
+        bal_val = float(balance or 0.0)
+        threading.Thread(
+            target=_sync_write_or_update_sheet,
+            args=(user_id, username, bal_val, order_details, row_key),
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        logger.warning("Failed to schedule Google Sheets backup: %s", exc.__class__.__name__)
+
+
+def schedule_order_sheet_backup(order_id: int) -> None:
+    """Reads an order + buyer from SQLite and writes/updates its row in Google Sheets."""
+    try:
+        with _db_lock, db() as conn:
+            o = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+            if not o:
+                return
+            u = conn.execute(
+                "SELECT username, first_name, balance FROM users WHERE user_id = ?",
+                (o["buyer_id"],),
+            ).fetchone()
+        uname = (u["username"] or u["first_name"] or "") if u else o["buyer_name"]
+        bal = float(u["balance"] or 0.0) if u else 0.0
+        s_price = float(o["sell_price"] or o["price"] or 0.0)
+        details = (
+            f"#SMM-{o['id']} | Panel #{o['panel_order_id']} | {o['service_name']} | "
+            f"Qty: {o['quantity']} | ৳{s_price:.2f} | Status: {o['status']} | Link: {o['target_link']}"
+        )
+        schedule_sheet_backup(
+            user_id=int(o["buyer_id"]),
+            username=uname,
+            balance=bal,
+            order_details=details,
+            row_key=f"#SMM-{o['id']}",
+        )
+    except Exception as exc:
+        logger.warning("Failed to schedule order sheet backup: %s", exc.__class__.__name__)
+
+
+# ---------------------------------------------------------------------------
+# 1. SMM PANEL API FUNCTIONS (Environment Variables Only, Never Log Full Key)
+# ---------------------------------------------------------------------------
+def _get_smm_api_config() -> tuple[str, str]:
+    """Reads SMM_API_URL and SMM_API_KEY exclusively from environment variables."""
+    api_url = os.environ.get("SMM_API_URL", "").strip()
+    api_key = os.environ.get("SMM_API_KEY", "").strip()
+    return api_url, api_key
+
+
+def _masked_key(api_key: str) -> str:
+    """Returns only the first 4 characters + '***' for safe logging."""
+    if not api_key:
+        return "EMPTY"
+    return f"{api_key[:4]}***"
+
+
+def _smm_api_post(payload: dict) -> dict:
+    """Sends a form-encoded POST request to SMM_API_URL with a 30-second timeout."""
+    api_url, api_key = _get_smm_api_config()
+    if not api_url or not api_key:
+        return {"ok": False, "error": "Panel API not set - contact admin"}
+
+    form_data = dict(payload)
+    form_data["key"] = api_key
+
+    try:
+        resp = requests.post(api_url, data=form_data, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.Timeout:
+        logger.warning(
+            "SMM Panel API timeout (action=%s, key=%s)",
+            payload.get("action"),
+            _masked_key(api_key),
+        )
+        return {"ok": False, "error": "Panel API request timed out (30s). Please try again."}
+    except requests.exceptions.RequestException as exc:
+        logger.warning(
+            "SMM Panel API network error (action=%s, key=%s): %s",
+            payload.get("action"),
+            _masked_key(api_key),
+            exc.__class__.__name__,
+        )
+        return {"ok": False, "error": "Network error connecting to SMM Panel API."}
+
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning(
+            "SMM Panel API returned non-JSON response (action=%s, key=%s)",
+            payload.get("action"),
+            _masked_key(api_key),
+        )
+        return {"ok": False, "error": "Invalid (non-JSON) response from SMM Panel API."}
+
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "Unexpected response format from SMM Panel API."}
+
+    if "error" in data and data["error"]:
+        return {"ok": False, "error": str(data["error"])}
+
+    return {"ok": True, "data": data}
+
+
+def panel_balance() -> dict:
+    """
+    action=balance, key=SMM_API_KEY.
+    Returns {"ok": True, "balance": float, "currency": str} or {"ok": False, "error": str}.
+    """
+    res = _smm_api_post({"action": "balance"})
+    if not res.get("ok"):
+        return res
+    data = res["data"]
+    try:
+        bal = float(data.get("balance", 0.0))
+    except (ValueError, TypeError):
+        return {"ok": False, "error": "Invalid balance value from panel."}
+    currency = str(data.get("currency", "USD")).strip() or "USD"
+    return {"ok": True, "balance": bal, "currency": currency}
+
+
+def panel_add_order(panel_service_id: int, link: str, quantity: int) -> dict:
+    """
+    action=add, key, service, link, quantity.
+    Returns {"ok": True, "order": int} or {"ok": False, "error": str}.
+    """
+    res = _smm_api_post(
+        {
+            "action": "add",
+            "service": int(panel_service_id),
+            "link": str(link).strip(),
+            "quantity": int(quantity),
+        }
+    )
+    if not res.get("ok"):
+        return res
+    data = res["data"]
+    order_id = data.get("order")
+    if order_id is None:
+        return {"ok": False, "error": str(data.get("error", "Panel did not return an order ID."))}
+    try:
+        return {"ok": True, "order": int(order_id)}
+    except (ValueError, TypeError):
+        return {"ok": False, "error": f"Invalid panel order ID: {order_id}"}
+
+
+def map_panel_status(raw_status: str) -> str:
+    """
+    Maps panel statuses to bot statuses:
+      Pending -> Pending
+      In progress / Processing -> Processing
+      Completed -> Completed
+      Partial -> Partial
+      Canceled / Cancelled -> Cancelled
+    """
+    s = (raw_status or "").strip().lower()
+    if s == "pending":
+        return "Pending"
+    if s in ("in progress", "inprogress", "processing"):
+        return "Processing"
+    if s == "completed":
+        return "Completed"
+    if s == "partial":
+        return "Partial"
+    if s in ("canceled", "cancelled", "refunded"):
+        return "Cancelled"
+    return raw_status.strip().title() if raw_status else "Pending"
+
+
+def panel_status(panel_order_id: int) -> dict:
+    """
+    action=status, key, order.
+    Returns status (mapped), raw_status, starts_count, remains, charge, currency.
+    """
+    res = _smm_api_post({"action": "status", "order": int(panel_order_id)})
+    if not res.get("ok"):
+        return res
+    data = res["data"]
+    raw_status = str(data.get("status", "Pending"))
+    mapped_status = map_panel_status(raw_status)
+    try:
+        starts_count = int(float(data.get("start_count") or 0))
+    except (ValueError, TypeError):
+        starts_count = 0
+    try:
+        remains = int(float(data.get("remains") or 0))
+    except (ValueError, TypeError):
+        remains = 0
+    try:
+        charge = float(data.get("charge") or 0.0)
+    except (ValueError, TypeError):
+        charge = 0.0
+    currency = str(data.get("currency", "USD")).strip() or "USD"
+    return {
+        "ok": True,
+        "status": mapped_status,
+        "raw_status": raw_status,
+        "starts_count": starts_count,
+        "remains": remains,
+        "charge": charge,
+        "currency": currency,
+    }
+
+
+def panel_refill(panel_order_id: int) -> dict:
+    """
+    action=refill, key, order.
+    Only called for services where refill_enabled == 1.
+    """
+    res = _smm_api_post({"action": "refill", "order": int(panel_order_id)})
+    if not res.get("ok"):
+        return res
+    data = res["data"]
+    if "error" in data and data["error"]:
+        return {"ok": False, "error": str(data["error"])}
+    refill_id = data.get("refill")
+    return {"ok": True, "refill": refill_id if refill_id is not None else "Submitted"}
+
+
+# ---------------------------------------------------------------------------
+# Platform Link Validation Helper (Step 2 of Order Flow)
+# ---------------------------------------------------------------------------
+def detect_required_platform(category: str, service_name: str) -> tuple[str, tuple[str, ...]] | None:
+    """Determines required platform domains from service category and name."""
+    combined = f"{category} {service_name}".lower()
+    if "facebook" in combined or "fb " in combined or combined.startswith("fb"):
+        return ("Facebook (facebook.com / fb.watch)", ("facebook.com", "fb.com", "fb.watch", "m.facebook.com"))
+    if "tiktok" in combined:
+        return ("TikTok (tiktok.com)", ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"))
+    if "instagram" in combined or "insta" in combined:
+        return ("Instagram (instagram.com)", ("instagram.com", "instagr.am"))
+    if "youtube" in combined or "yt " in combined:
+        return ("YouTube (youtube.com / youtu.be)", ("youtube.com", "youtu.be", "m.youtube.com"))
+    return None
+
+
+def validate_service_link(category: str, service_name: str, link: str) -> tuple[bool, str]:
+    """
+    Validates that the link starts with http:// or https:// and matches the service platform.
+    """
+    clean = (link or "").strip()
+    if not (clean.startswith("http://") or clean.startswith("https://")):
+        return (
+            False,
+            "⚠️ অবৈধ লিংক! লিংকটি অবশ্যই <code>http://</code> অথবা <code>https://</code> দিয়ে শুরু হতে হবে।",
+        )
+    try:
+        parsed = urllib.parse.urlparse(clean)
+        host = (parsed.netloc or "").lower()
+    except Exception:
+        host = ""
+    if not host:
+        return (
+            False,
+            "⚠️ সঠিক ওয়েব লিংক প্রদান করুন (যেমন: <code>https://...</code>)।",
+        )
+
+    req = detect_required_platform(category, service_name)
+    if req is not None:
+        label, domains = req
+        if not any(host == d or host.endswith("." + d) for d in domains):
+            return (
+                False,
+                f"⚠️ ভুল প্ল্যাটফর্মের লিংক! এই সার্ভিসটির জন্য অবশ্যই <b>{label}</b> লিংক দিতে হবে।\n"
+                f"আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি। সঠিক লিংক পাঠান:",
+            )
+    return (True, "")
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +636,8 @@ BTN_CANCEL = "❌ বাতিল করুন"
 
 # Admin Panel Buttons
 BTN_A_ADD_SMM = "➕ SMM সার্ভিস অ্যাড"
-BTN_A_ADD_FILE = "📁 ফাইল প্রোডাক্ট অ্যাড"
+BTN_A_EDIT_SMM = "✏️ সার্ভিস এডিট / Panel ID"
+BTN_A_USERS = "👥 সকল ইউজার (All Users)"
 BTN_A_LIST = "📋 সব সার্ভিস দেখুন"
 BTN_A_DEL = "🗑️ সার্ভিস ডিলিট"
 BTN_A_ORDERS = "📦 পেন্ডিং অর্ডার"
@@ -129,21 +647,36 @@ BTN_A_PAYMENTS = "⚙️ পেমেন্ট নাম্বার সেট"
 BTN_A_SETTINGS = "🎁 বোনাস ও সাপোর্ট সেট"
 BTN_A_BROADCAST = "📢 ব্রডকাস্ট মেসেজ"
 BTN_A_STATS = "📈 বট স্ট্যাটাস"
+BTN_A_ADD_FILE = "📁 ফাইল প্রোডাক্ট অ্যাড"
 
 # Conversation States stored in context.user_data["state"]
 ST_ORDER_LINK = "order_link"
 ST_ORDER_QTY = "order_qty"
+ST_ORDER_CONFIRM = "order_confirm"
 ST_DEP_AMOUNT = "dep_amount"
 ST_DEP_TRXID = "dep_trxid"
 ST_SUPPORT_MSG = "support_msg"
 
-# Admin States
+# Admin Add Service States
 ST_ADD_SMM_CAT = "add_smm_cat"
 ST_ADD_SMM_NAME = "add_smm_name"
+ST_ADD_SMM_PID = "add_smm_pid"
+ST_ADD_SMM_PRATE = "add_smm_prate"
 ST_ADD_SMM_RATE = "add_smm_rate"
 ST_ADD_SMM_MIN = "add_smm_min"
 ST_ADD_SMM_MAX = "add_smm_max"
+ST_ADD_SMM_REFILL = "add_smm_refill"
 ST_ADD_SMM_DESC = "add_smm_desc"
+
+# Admin Edit Service States
+ST_EDIT_SMM_NAME = "edit_smm_name"
+ST_EDIT_SMM_PID = "edit_smm_pid"
+ST_EDIT_SMM_PRATE = "edit_smm_prate"
+ST_EDIT_SMM_RATE = "edit_smm_rate"
+ST_EDIT_SMM_MIN = "edit_smm_min"
+ST_EDIT_SMM_MAX = "edit_smm_max"
+ST_EDIT_SMM_REFILL = "edit_smm_refill"
+ST_EDIT_SMM_ACTIVE = "edit_smm_active"
 
 ST_ADD_FILE_NAME = "add_file_name"
 ST_ADD_FILE_PRICE = "add_file_price"
@@ -158,13 +691,12 @@ ST_SET_NAGAD = "set_nagad"
 ST_SET_ROCKET = "set_rocket"
 ST_SET_BINANCE = "set_binance"
 ST_SET_SUPPORT = "set_support"
-ST_SET_REFER_BONUS = "set_refer_bonus"
 ST_SET_DAILY_BONUS = "set_daily_bonus"
 ST_BROADCAST_TEXT = "broadcast_text"
 
 
 # ---------------------------------------------------------------------------
-# Database Layer (SQLite with Thread Lock)
+# Database Layer (SQLite with Thread Lock & Safe Schema Migrations)
 # ---------------------------------------------------------------------------
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=25.0)
@@ -172,129 +704,323 @@ def db() -> sqlite3.Connection:
     return conn
 
 
-DEFAULT_SMM_SERVICES = [
-    # category, name, service_type, rate_per_1k, min_qty, max_qty, description, file_id
+# Exact 13 Active Services:
+# - All 13 are linked with their real panel_service_id
+# - Average time display = 2-6 hours for all 13
+# - Sell price (rate_per_1k) is what the customer pays
+# - Where Min is not listed, min_qty = 0 (editable in Admin, never invented)
+# - Where Max is unlimited, max_qty = -1; where Max is not listed, max_qty = 0 (editable in Admin)
+# - Facebook Reaction (Love) is clearly labeled Bot Data
+# - No Telegram services, no YouTube Subscribers, no premium services
+ACTIVE_13_SERVICES = [
+    # (category, name, service_type, rate_per_1k, min_qty, max_qty, description, file_id,
+    #  panel_service_id, refill_enabled, refill_type, avg_time, panel_rate, markup, is_active)
+    # --- Instagram (1-4) ---
     (
-        "📘 Facebook VIP",
-        "FB Page/Profile Followers [Non-Drop VIP]",
+        "📸 Instagram",
+        "Instagram Followers",
         "smm",
-        85,
-        100,
-        100000,
-        "⚡ সুপার ফাস্ট ডেলিভারি | ১০০% রিয়েল প্রোফাইল ফলোয়ার | ৩০ দিন গ্যারান্টি।",
-        None,
-    ),
-    (
-        "📘 Facebook VIP",
-        "FB Post/Photo Likes & Love Reacts [Instant]",
-        "smm",
-        50,
-        100,
-        50000,
-        "🔥 অটোমেটিক ফাস্ট স্টার্ট | পাবলিক পোস্ট হতে হবে।",
-        None,
-    ),
-    (
-        "📘 Facebook VIP",
-        "FB Reels & Video Views [Monetizable]",
-        "smm",
-        35,
-        500,
-        1000000,
-        "🎬 মনিটাইজেশন ফ্রেন্ডলি রিয়েল ভিউ | নন-ড্রপ।",
-        None,
-    ),
-    (
-        "🎵 TikTok Viral",
-        "TikTok Real Followers [HQ Active]",
-        "smm",
-        120,
-        100,
-        100000,
-        "🚀 হাই-কোয়ালিটি টিকটক ফলোয়ার | অ্যাকাউন্ট পাবলিক রাখুন।",
-        None,
-    ),
-    (
-        "🎵 TikTok Viral",
-        "TikTok Video Likes + Hearts [Super Fast]",
-        "smm",
-        45,
-        100,
-        200000,
-        "❤️ ভিডিও ভাইরাল করার জন্য সেরা লাইক সার্ভিস।",
-        None,
-    ),
-    (
-        "🎵 TikTok Viral",
-        "TikTok Viral Video Views [Instant Start]",
-        "smm",
-        12,
-        1000,
-        5000000,
-        "⚡ ১ মিনিটে স্টার্ট | আনলিমিটেড ফাস্ট ভিউ।",
-        None,
-    ),
-    (
-        "▶️ YouTube Studio",
-        "YouTube Subscribers [Non-Drop Guarantee]",
-        "smm",
-        420,
-        50,
-        50000,
-        "🏆 চ্যানেল মনিটাইজেশনের জন্য ১০০% সেফ সাবস্ক্রাইবার।",
-        None,
-    ),
-    (
-        "▶️ YouTube Studio",
-        "YouTube High-Retention Video Views",
-        "smm",
-        90,
-        500,
+        600.0,
+        0,
         500000,
-        "📈 হাই রিটেনশন ভিউ + ওয়াচটাইম বুস্ট।",
+        "⏱️ Average time: 2-6 hours | 🔄 LifeTime refill | Drop may happen, refill only if panel provides it.",
         None,
+        11432,
+        1,
+        "LifeTime refill",
+        "2-6 hours",
+        486.72,
+        round(600.0 - 486.72, 4),
+        1,
     ),
     (
-        "📸 Instagram Pro",
-        "Instagram Real Followers [Refill Guarantee]",
+        "📸 Instagram",
+        "Instagram Likes",
         "smm",
-        110,
-        100,
-        200000,
-        "✨ প্রিমিয়াম অ্যাকাউন্ট ফলোয়ার | ৩৬৫ দিন রিফিল।",
-        None,
-    ),
-    (
-        "📸 Instagram Pro",
-        "Instagram Post/Reels Likes [Instant]",
-        "smm",
-        35,
-        100,
-        100000,
-        "⚡ ইনস্ট্যান্ট ডেলিভারি | রিয়েল লুকিং প্রোফাইল।",
-        None,
-    ),
-    (
-        "✈️ Telegram VIP",
-        "Telegram Channel/Group Members [Non-Drop]",
-        "smm",
-        130,
-        100,
-        100000,
-        "💎 জিরো ড্রপ গ্যারান্টি মেম্বার | পাবলিক চ্যানেল/গ্রুপ।",
-        None,
-    ),
-    (
-        "✈️ Telegram VIP",
-        "Telegram Post Views [Last 1 Post]",
-        "smm",
-        15,
-        500,
+        30.0,
+        0,
         1000000,
-        "👁️ সুপার ফাস্ট পোস্ট ভিউ।",
+        "⏱️ Average time: 2-6 hours | 🔄 LifeTime refill | Drop may happen, refill only if panel provides it.",
         None,
+        10604,
+        1,
+        "LifeTime refill",
+        "2-6 hours",
+        16.38,
+        round(30.0 - 16.38, 4),
+        1,
+    ),
+    (
+        "📸 Instagram",
+        "Instagram Views",
+        "smm",
+        1.13,
+        100,
+        5000000,
+        "⏱️ Average time: 2-6 hours | 🚫 No Refill.",
+        None,
+        9892,
+        0,
+        "No Refill",
+        "2-6 hours",
+        0.13,
+        round(1.13 - 0.13, 4),
+        1,
+    ),
+    (
+        "📸 Instagram",
+        "Instagram Impression",
+        "smm",
+        15.0,
+        0,
+        1000000,
+        "⏱️ Average time: 2-6 hours | 🚫 No Refill.",
+        None,
+        9873,
+        0,
+        "No Refill",
+        "2-6 hours",
+        8.749,
+        round(15.0 - 8.749, 4),
+        1,
+    ),
+    # --- TikTok (5-8) ---
+    (
+        "🎵 TikTok",
+        "TikTok Followers",
+        "smm",
+        180.0,
+        0,
+        100000,
+        "⏱️ Average time: 2-6 hours | 🚫 No Refill.",
+        None,
+        11708,
+        0,
+        "No Refill",
+        "2-6 hours",
+        169.182,
+        round(180.0 - 169.182, 4),
+        1,
+    ),
+    (
+        "🎵 TikTok",
+        "TikTok Likes",
+        "smm",
+        40.0,
+        100,
+        5000000,
+        "⏱️ Average time: 2-6 hours | 🔄 REFILL 365D | Drop may happen, refill only if panel provides it.",
+        None,
+        10670,
+        1,
+        "REFILL 365D",
+        "2-6 hours",
+        30.186,
+        round(40.0 - 30.186, 4),
+        1,
+    ),
+    (
+        "🎵 TikTok",
+        "TikTok Views",
+        "smm",
+        2.25,
+        100,
+        -1,  # Max unlimited
+        "⏱️ Average time: 2-6 hours | 🔄 REFILL 30D | Drop may happen, refill only if panel provides it.",
+        None,
+        11730,
+        1,
+        "REFILL 30D",
+        "2-6 hours",
+        1.248,
+        round(2.25 - 1.248, 4),
+        1,
+    ),
+    (
+        "🎵 TikTok",
+        "TikTok Shares",
+        "smm",
+        10.0,
+        10,
+        100000000,
+        "⏱️ Average time: 2-6 hours | 🔄 LifeTime refill | Drop may happen, refill only if panel provides it.",
+        None,
+        10489,
+        1,
+        "LifeTime refill",
+        "2-6 hours",
+        8.606,
+        round(10.0 - 8.606, 4),
+        1,
+    ),
+    # --- Facebook (9-11) ---
+    (
+        "📘 Facebook",
+        "Facebook Followers",
+        "smm",
+        30.0,
+        100,
+        15000,
+        "⏱️ Average time: 2-6 hours | 🔄 REFILL 30D | Drop may happen, refill only if panel provides it.",
+        None,
+        11531,
+        1,
+        "REFILL 30D",
+        "2-6 hours",
+        23.439,
+        round(30.0 - 23.439, 4),
+        1,
+    ),
+    (
+        "📘 Facebook",
+        "Facebook Reaction (Love) [Bot Data]",
+        "smm",
+        50.0,
+        10,
+        50000,
+        "🤖 Bot Data | ⏱️ Average time: 2-6 hours | 🚫 No Refill.",
+        None,
+        10834,
+        0,
+        "No Refill",
+        "2-6 hours",
+        44.681,
+        round(50.0 - 44.681, 4),
+        1,
+    ),
+    (
+        "📘 Facebook",
+        "Facebook Views",
+        "smm",
+        10.0,
+        100,
+        0,  # Max not listed -> editable in Admin
+        "⏱️ Average time: 2-6 hours | 🔄 REFILL 365D | Drop may happen, refill only if panel provides it.",
+        None,
+        7213,
+        1,
+        "REFILL 365D",
+        "2-6 hours",
+        4.511,
+        round(10.0 - 4.511, 4),
+        1,
+    ),
+    # --- YouTube (12-13) ---
+    (
+        "▶️ YouTube",
+        "YouTube Views",
+        "smm",
+        130.0,
+        100,
+        10000000,
+        "⏱️ Average time: 2-6 hours | 🔄 REFILL 365D | Drop may happen, refill only if panel provides it.",
+        None,
+        8048,
+        1,
+        "REFILL 365D",
+        "2-6 hours",
+        111.358,
+        round(130.0 - 111.358, 4),
+        1,
+    ),
+    (
+        "▶️ YouTube",
+        "YouTube Likes",
+        "smm",
+        90.0,
+        10,
+        200000,
+        "⏱️ Average time: 2-6 hours | 🔄 LifeTime refill | Drop may happen, refill only if panel provides it.",
+        None,
+        11838,
+        1,
+        "LifeTime refill",
+        "2-6 hours",
+        79.248,
+        round(90.0 - 79.248, 4),
+        1,
     ),
 ]
+
+
+def _sync_active_13_services(conn: sqlite3.Connection) -> None:
+    """
+    Ensures the 13 active services are present and linked, removes any legacy unlinked (panel_service_id = 0),
+    Telegram, YouTube Subscribers, or premium placeholder services, while keeping any custom linked services
+    added later by Admin via the Admin Panel.
+    """
+    conn.execute(
+        """
+        DELETE FROM services
+        WHERE panel_service_id = 0
+           OR LOWER(category) LIKE '%telegram%'
+           OR LOWER(name) LIKE '%telegram%'
+           OR LOWER(name) LIKE '%subscriber%'
+           OR LOWER(name) LIKE '%capcut%'
+           OR service_type = 'file'
+        """
+    )
+
+    for item in ACTIVE_13_SERVICES:
+        (
+            cat,
+            name,
+            stype,
+            sell_rate,
+            mn,
+            mx,
+            desc,
+            fid,
+            pid,
+            ref_en,
+            ref_type,
+            avg_t,
+            prate,
+            mk,
+            is_act,
+        ) = item
+        existing = conn.execute(
+            "SELECT id, min_qty, max_qty FROM services WHERE panel_service_id = ?",
+            (pid,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO services
+                (category, name, service_type, rate_per_1k, min_qty, max_qty, description,
+                 file_id, panel_service_id, refill_enabled, refill_type, avg_time,
+                 panel_rate, markup, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                item,
+            )
+        else:
+            # Preserve admin-edited Min/Max if Admin already customized them
+            new_min = existing["min_qty"] if mn == 0 and int(existing["min_qty"] or 0) > 0 else mn
+            new_max = existing["max_qty"] if mx == 0 and int(existing["max_qty"] or 0) > 0 else mx
+            conn.execute(
+                """
+                UPDATE services
+                SET category = ?, name = ?, rate_per_1k = ?, min_qty = ?, max_qty = ?,
+                    description = ?, refill_enabled = ?, refill_type = ?, avg_time = ?,
+                    panel_rate = ?, markup = ?, is_active = 1
+                WHERE panel_service_id = ?
+                """,
+                (
+                    cat,
+                    name,
+                    sell_rate,
+                    new_min,
+                    new_max,
+                    desc,
+                    ref_en,
+                    ref_type,
+                    avg_t,
+                    prate,
+                    mk,
+                    pid,
+                ),
+            )
 
 
 def init_db() -> None:
@@ -316,28 +1042,43 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS services (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                category        TEXT NOT NULL,
-                name            TEXT NOT NULL,
-                service_type    TEXT NOT NULL DEFAULT 'smm',
-                rate_per_1k     REAL NOT NULL DEFAULT 100.0,
-                min_qty         INTEGER NOT NULL DEFAULT 100,
-                max_qty         INTEGER NOT NULL DEFAULT 100000,
-                description     TEXT NOT NULL DEFAULT '',
-                file_id         TEXT
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                category         TEXT NOT NULL,
+                name             TEXT NOT NULL,
+                service_type     TEXT NOT NULL DEFAULT 'smm',
+                rate_per_1k      REAL NOT NULL DEFAULT 100.0,
+                min_qty          INTEGER NOT NULL DEFAULT 0,
+                max_qty          INTEGER NOT NULL DEFAULT 0,
+                description      TEXT NOT NULL DEFAULT '',
+                file_id          TEXT,
+                panel_service_id INTEGER NOT NULL DEFAULT 0,
+                refill_enabled   INTEGER NOT NULL DEFAULT 0,
+                refill_type      TEXT NOT NULL DEFAULT 'No Refill',
+                avg_time         TEXT NOT NULL DEFAULT '2-6 hours',
+                panel_rate       REAL NOT NULL DEFAULT 0.0,
+                markup           REAL NOT NULL DEFAULT 0.0,
+                is_active        INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS orders (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                service_id      INTEGER NOT NULL,
-                service_name    TEXT NOT NULL,
-                buyer_id        INTEGER NOT NULL,
-                buyer_name      TEXT NOT NULL,
-                target_link     TEXT NOT NULL DEFAULT '',
-                quantity        INTEGER NOT NULL DEFAULT 1,
-                price           REAL NOT NULL DEFAULT 0.0,
-                status          TEXT NOT NULL DEFAULT 'pending',
-                created_at      TEXT DEFAULT CURRENT_TIMESTAMP
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id       INTEGER NOT NULL,
+                service_name     TEXT NOT NULL,
+                buyer_id         INTEGER NOT NULL,
+                buyer_name       TEXT NOT NULL,
+                target_link      TEXT NOT NULL DEFAULT '',
+                quantity         INTEGER NOT NULL DEFAULT 1,
+                price            REAL NOT NULL DEFAULT 0.0,
+                status           TEXT NOT NULL DEFAULT 'Pending',
+                panel_order_id   INTEGER NOT NULL DEFAULT 0,
+                panel_service_id INTEGER NOT NULL DEFAULT 0,
+                panel_cost       REAL NOT NULL DEFAULT 0.0,
+                sell_price       REAL NOT NULL DEFAULT 0.0,
+                starts_count     INTEGER NOT NULL DEFAULT 0,
+                remains          INTEGER NOT NULL DEFAULT 0,
+                refunded         INTEGER NOT NULL DEFAULT 0,
+                refer_bonus_paid INTEGER NOT NULL DEFAULT 0,
+                created_at       TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS balance_requests (
@@ -357,22 +1098,153 @@ def init_db() -> None:
             );
             """
         )
-        count = conn.execute("SELECT COUNT(*) FROM services").fetchone()[0]
-        if count == 0:
-            conn.executemany(
-                """
-                INSERT INTO services
-                (category, name, service_type, rate_per_1k, min_qty, max_qty, description, file_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                DEFAULT_SMM_SERVICES,
+
+        # Safe ALTER TABLE migrations for existing databases
+        svc_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(services)").fetchall()
+        }
+        if "panel_service_id" not in svc_cols:
+            conn.execute(
+                "ALTER TABLE services ADD COLUMN panel_service_id INTEGER NOT NULL DEFAULT 0"
             )
+        if "refill_enabled" not in svc_cols:
+            conn.execute(
+                "ALTER TABLE services ADD COLUMN refill_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+        if "refill_type" not in svc_cols:
+            conn.execute(
+                "ALTER TABLE services ADD COLUMN refill_type TEXT NOT NULL DEFAULT 'No Refill'"
+            )
+        if "avg_time" not in svc_cols:
+            conn.execute(
+                "ALTER TABLE services ADD COLUMN avg_time TEXT NOT NULL DEFAULT '2-6 hours'"
+            )
+        if "panel_rate" not in svc_cols:
+            conn.execute(
+                "ALTER TABLE services ADD COLUMN panel_rate REAL NOT NULL DEFAULT 0.0"
+            )
+        if "markup" not in svc_cols:
+            conn.execute(
+                "ALTER TABLE services ADD COLUMN markup REAL NOT NULL DEFAULT 0.0"
+            )
+        if "is_active" not in svc_cols:
+            conn.execute(
+                "ALTER TABLE services ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"
+            )
+
+        ord_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(orders)").fetchall()
+        }
+        if "panel_order_id" not in ord_cols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN panel_order_id INTEGER NOT NULL DEFAULT 0"
+            )
+        if "panel_service_id" not in ord_cols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN panel_service_id INTEGER NOT NULL DEFAULT 0"
+            )
+        if "panel_cost" not in ord_cols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN panel_cost REAL NOT NULL DEFAULT 0.0"
+            )
+        if "sell_price" not in ord_cols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN sell_price REAL NOT NULL DEFAULT 0.0"
+            )
+        if "starts_count" not in ord_cols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN starts_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "remains" not in ord_cols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN remains INTEGER NOT NULL DEFAULT 0"
+            )
+        if "refunded" not in ord_cols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN refunded INTEGER NOT NULL DEFAULT 0"
+            )
+        if "refer_bonus_paid" not in ord_cols:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN refer_bonus_paid INTEGER NOT NULL DEFAULT 0"
+            )
+
+        _sync_active_13_services(conn)
         conn.commit()
 
 
 # ---------------------------------------------------------------------------
-# Database Helper Functions
+# Pricing, Min/Max & Service Display Helpers
 # ---------------------------------------------------------------------------
+def get_sell_rate_per_1k(s: sqlite3.Row) -> float:
+    """
+    Returns the exact sell price per 1000 that the customer pays.
+    """
+    sell_rate = float(s["rate_per_1k"] or 0.0)
+    if sell_rate > 0:
+        return round(sell_rate, 4)
+    panel_rate = float(s["panel_rate"] or 0.0)
+    markup = float(s["markup"] or 0.0)
+    return round(panel_rate + markup, 4)
+
+
+def calc_sell_price(s: sqlite3.Row, quantity: int) -> float:
+    """Calculates customer total price = sell price per 1000 * quantity / 1000."""
+    rate_1k = get_sell_rate_per_1k(s)
+    return round((rate_1k * int(quantity)) / 1000.0, 2)
+
+
+def calc_panel_cost(s: sqlite3.Row, quantity: int) -> float:
+    """Calculates panel cost = panel_rate * quantity / 1000."""
+    panel_rate = float(s["panel_rate"] or 0.0)
+    if panel_rate <= 0:
+        return 0.0
+    return round((panel_rate * int(quantity)) / 1000.0, 4)
+
+
+def get_refill_label(s: sqlite3.Row) -> str:
+    """Returns the service's refill label (e.g. LifeTime refill, REFILL 365D, REFILL 30D, No Refill)."""
+    try:
+        rtype = str(s["refill_type"] or "").strip()
+    except Exception:
+        rtype = ""
+    if rtype:
+        return rtype
+    return "Refill" if int(s["refill_enabled"] or 0) == 1 else "No Refill"
+
+
+def get_avg_time_label(s: sqlite3.Row) -> str:
+    """Returns the service's average delivery time display (defaults to 2-6 hours)."""
+    try:
+        avg_t = str(s["avg_time"] or "").strip()
+    except Exception:
+        avg_t = ""
+    return avg_t or "2-6 hours"
+
+
+def format_min_max(s: sqlite3.Row, admin_view: bool = False) -> str:
+    """
+    Formats Min and Max without inventing numbers when Min or Max was not specified.
+    """
+    mn = int(s["min_qty"] or 0)
+    mx = int(s["max_qty"] or 0)
+    parts = []
+    if mn > 0:
+        parts.append(f"Min: {mn}")
+    elif admin_view:
+        parts.append("Min: Editable in Admin")
+
+    if mx > 0:
+        parts.append(f"Max: {mx}")
+    elif mx == -1:
+        parts.append("Max: Unlimited")
+    elif admin_view:
+        parts.append("Max: Editable in Admin")
+
+    return " | ".join(parts) if parts else "Flexible Quantity"
+
+
 def get_setting(key: str, default: str = "") -> str:
     with _db_lock, db() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -390,9 +1262,11 @@ def set_setting(key: str, value: str) -> None:
 
 
 def ensure_user(user_id: int, username: str = "", first_name: str = "") -> sqlite3.Row:
+    is_new = False
     with _db_lock, db() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
         if row is None:
+            is_new = True
             conn.execute(
                 "INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
                 (user_id, username or "", first_name or "User"),
@@ -400,13 +1274,23 @@ def ensure_user(user_id: int, username: str = "", first_name: str = "") -> sqlit
             conn.commit()
             row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
         else:
-            conn.execute(
-                "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
-                (username or row["username"], first_name or row["first_name"], user_id),
-            )
-            conn.commit()
-            row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        return row
+            new_uname = username or row["username"]
+            new_fname = first_name or row["first_name"]
+            if new_uname != row["username"] or new_fname != row["first_name"]:
+                conn.execute(
+                    "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
+                    (new_uname, new_fname, user_id),
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    if is_new and row is not None:
+        schedule_sheet_backup(
+            user_id=user_id,
+            username=row["username"] or row["first_name"] or "",
+            balance=float(row["balance"] or 0.0),
+            order_details="New User Joined",
+        )
+    return row
 
 
 def get_balance(user_id: int) -> float:
@@ -415,7 +1299,12 @@ def get_balance(user_id: int) -> float:
         return round(float(row["balance"]), 2) if row else 0.0
 
 
-def add_balance(user_id: int, amount: float, is_deposit: bool = False) -> float:
+def add_balance(
+    user_id: int,
+    amount: float,
+    is_deposit: bool = False,
+    reason: str = "Balance Updated",
+) -> float:
     ensure_user(user_id)
     with _db_lock, db() as conn:
         if is_deposit and amount > 0:
@@ -429,8 +1318,21 @@ def add_balance(user_id: int, amount: float, is_deposit: bool = False) -> float:
                 (amount, user_id),
             )
         conn.commit()
-        row = conn.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        return round(float(row["balance"]), 2) if row else 0.0
+        row = conn.execute(
+            "SELECT username, first_name, balance FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        new_bal = round(float(row["balance"]), 2) if row else 0.0
+        uname = (row["username"] or row["first_name"] or "") if row else ""
+
+    sign = "+" if amount >= 0 else ""
+    schedule_sheet_backup(
+        user_id=user_id,
+        username=uname,
+        balance=new_bal,
+        order_details=f"{reason} ({sign}৳{amount:.2f})",
+    )
+    return new_bal
 
 
 def record_spend(user_id: int, amount: float) -> None:
@@ -442,18 +1344,101 @@ def record_spend(user_id: int, amount: float) -> None:
         conn.commit()
 
 
-def list_services(category: str | None = None) -> list[sqlite3.Row]:
+async def credit_referral_on_completed_order(
+    order_id: int, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Credits 10% of the referred user's COMPLETED order amount to their referrer.
+    Never credits on join, and never credits twice for the same order.
+    """
+    with _db_lock, db() as conn:
+        order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+        if not order:
+            return
+        if int(order["refer_bonus_paid"] or 0) == 1:
+            return
+        if str(order["status"] or "").strip().lower() != "completed":
+            return
+
+        buyer = conn.execute(
+            "SELECT user_id, first_name, referred_by FROM users WHERE user_id = ?",
+            (order["buyer_id"],),
+        ).fetchone()
+        if not buyer:
+            return
+        ref_id = int(buyer["referred_by"] or 0)
+        if ref_id <= 0 or ref_id == int(order["buyer_id"]):
+            conn.execute(
+                "UPDATE orders SET refer_bonus_paid = 1 WHERE id = ?", (order_id,)
+            )
+            conn.commit()
+            return
+
+        order_amount = float(order["sell_price"] or order["price"] or 0.0)
+        bonus = round(order_amount * 0.10, 2)
+        conn.execute("UPDATE orders SET refer_bonus_paid = 1 WHERE id = ?", (order_id,))
+        if bonus > 0:
+            conn.execute(
+                "UPDATE users SET balance = ROUND(balance + ?, 2), "
+                "refer_earned = ROUND(refer_earned + ?, 2) "
+                "WHERE user_id = ?",
+                (bonus, bonus, ref_id),
+            )
+        conn.commit()
+        ref_row = conn.execute(
+            "SELECT username, first_name, balance FROM users WHERE user_id = ?",
+            (ref_id,),
+        ).fetchone()
+
+    if bonus > 0 and ref_row:
+        schedule_sheet_backup(
+            user_id=ref_id,
+            username=ref_row["username"] or ref_row["first_name"] or "",
+            balance=float(ref_row["balance"] or 0.0),
+            order_details=f"10% Referral Bonus (+৳{bonus:.2f}) from Completed Order #SMM-{order_id}",
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=ref_id,
+                text=(
+                    "🎁 <b>রেফারেল ১০% অর্ডার কমিশন!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 আপনার রেফার করা ইউজার একটি অর্ডার সম্পন্ন (Completed) করেছে।\n"
+                    f"💰 অর্ডার মূল্যের ১০% বোনাস: <b>+৳{bonus:.2f}</b> আপনার ওয়ালেটে যোগ হয়েছে!\n"
+                    f"💳 বর্তমান ব্যালেন্স: <b>৳{float(ref_row['balance']):.2f}</b>"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+def list_services(category: str | None = None, include_disabled: bool = False) -> list[sqlite3.Row]:
     with _db_lock, db() as conn:
         if category:
+            if include_disabled:
+                return conn.execute(
+                    "SELECT * FROM services WHERE category = ? ORDER BY id ASC", (category,)
+                ).fetchall()
             return conn.execute(
-                "SELECT * FROM services WHERE category = ? ORDER BY id ASC", (category,)
+                "SELECT * FROM services WHERE category = ? AND is_active = 1 ORDER BY id ASC",
+                (category,),
             ).fetchall()
-        return conn.execute("SELECT * FROM services ORDER BY category ASC, id ASC").fetchall()
+        if include_disabled:
+            return conn.execute("SELECT * FROM services ORDER BY id ASC").fetchall()
+        return conn.execute(
+            "SELECT * FROM services WHERE is_active = 1 ORDER BY id ASC"
+        ).fetchall()
 
 
-def list_categories() -> list[str]:
+def list_categories(include_disabled: bool = False) -> list[str]:
     with _db_lock, db() as conn:
-        rows = conn.execute("SELECT DISTINCT category FROM services ORDER BY id ASC").fetchall()
+        if include_disabled:
+            rows = conn.execute("SELECT DISTINCT category FROM services ORDER BY id ASC").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT category FROM services WHERE is_active = 1 ORDER BY id ASC"
+            ).fetchall()
         return [r["category"] for r in rows]
 
 
@@ -524,12 +1509,13 @@ def main_menu(user_id: int) -> ReplyKeyboardMarkup:
 
 def admin_menu() -> ReplyKeyboardMarkup:
     rows = [
-        [_mkb(BTN_A_ADD_SMM, "success"), _mkb(BTN_A_ADD_FILE, "primary")],
-        [_mkb(BTN_A_LIST, "primary"), _mkb(BTN_A_DEL, "danger")],
-        [_mkb(BTN_A_ORDERS, "danger"), _mkb(BTN_A_DEPOSITS, "success")],
-        [_mkb(BTN_A_BALANCE, "primary"), _mkb(BTN_A_PAYMENTS, "success")],
-        [_mkb(BTN_A_SETTINGS, "primary"), _mkb(BTN_A_BROADCAST, "danger")],
-        [_mkb(BTN_A_STATS, "success"), _mkb(BTN_BACK, "primary")],
+        [_mkb(BTN_A_ADD_SMM, "success"), _mkb(BTN_A_EDIT_SMM, "primary")],
+        [_mkb(BTN_A_USERS, "success"), _mkb(BTN_A_LIST, "primary")],
+        [_mkb(BTN_A_DEL, "danger"), _mkb(BTN_A_ORDERS, "danger")],
+        [_mkb(BTN_A_DEPOSITS, "success"), _mkb(BTN_A_BALANCE, "primary")],
+        [_mkb(BTN_A_PAYMENTS, "success"), _mkb(BTN_A_SETTINGS, "primary")],
+        [_mkb(BTN_A_BROADCAST, "danger"), _mkb(BTN_A_STATS, "success")],
+        [_mkb(BTN_BACK, "primary")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -553,19 +1539,18 @@ async def show_main_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = (
         f"👑 <b>স্বাগতম, {user.first_name}!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🌟 <b>VIP SMM PANEL & DIGITAL AGENCY</b>\n"
-        "বাংলাদেশের সেরা ও দ্রুততম অটোমেটিক সোশ্যাল মিডিয়া বুস্ট এবং প্রিমিয়াম সার্ভিস প্যানেলে আপনাকে স্বাগতম!\n\n"
+        "🌟 <b>VIP SMM PANEL</b>\n"
+        "স্বয়ংক্রিয় সোশ্যাল মিডিয়া বুস্ট প্যানেলে আপনাকে স্বাগতম!\n\n"
         "📊 <b>আপনার অ্যাকাউন্ট ড্যাশবোর্ড:</b>\n"
         f"├─ 🆔 <b>User ID:</b> <code>{user.id}</code>\n"
         f"├─ 💳 <b>বর্তমান ব্যালেন্স:</b> <b>৳{u['balance']:.2f}</b>\n"
         f"├─ 📦 <b>মোট অর্ডার:</b> {order_cnt} টি\n"
         f"└─ 🏆 <b>ভিআইপি র‍্যাংক:</b> {badge}\n\n"
-        "🔥 <b>আমাদের প্রিমিয়াম সার্ভিসসমূহ:</b>\n"
-        "├─ 📘 Facebook Followers, Likes, Reels Views\n"
-        "├─ 🎵 TikTok Real Followers, Hearts & Viral Views\n"
-        "├─ ▶️ YouTube Subscribers & 4000h Watchtime\n"
-        "├─ 📸 Instagram & ✈️ Telegram Non-Drop Members\n"
-        "└─ 📁 VIP Digital Files & Premium Tools\n"
+        "🔥 <b>আমাদের অ্যাক্টিভ সার্ভিসসমূহ (⏱️ Average time: 2-6 hours):</b>\n"
+        "├─ 📸 Instagram (Followers, Likes, Views, Impression)\n"
+        "├─ 🎵 TikTok (Followers, Likes, Views, Shares)\n"
+        "├─ 📘 Facebook (Followers, Reaction [Love] - Bot Data, Views)\n"
+        "└─ ▶️ YouTube (Views, Likes)\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "👇 <b>শুরু করতে নিচের রঙিন মেনু বা বাটন সিলেক্ট করুন:</b>"
     )
@@ -614,9 +1599,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "SELECT user_id FROM users WHERE user_id = ?", (user.id,)
         ).fetchone()
 
-    u = ensure_user(user.id, user.username or "", user.first_name or "User")
+    ensure_user(user.id, user.username or "", user.first_name or "User")
 
-    # Handle Referral Deep-Link (/start ref_12345) for brand new users
+    # Handle Referral Deep-Link (/start ref_12345) for brand new users:
+    # Links referred_by and increments refer_count ONLY. Never pays bonus on join!
     if existing is None and context.args:
         arg = str(context.args[0]).strip()
         if arg.startswith("ref_"):
@@ -625,10 +1611,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except ValueError:
                 ref_id = 0
             if ref_id and ref_id != user.id:
-                try:
-                    bonus = float(get_setting("refer_bonus", "2") or 2)
-                except ValueError:
-                    bonus = 2.0
                 ensure_user(ref_id)
                 with _db_lock, db() as conn:
                     conn.execute(
@@ -636,34 +1618,19 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         (ref_id, user.id),
                     )
                     conn.execute(
-                        "UPDATE users SET balance = ROUND(balance + ?, 2), "
-                        "refer_count = refer_count + 1, "
-                        "refer_earned = ROUND(refer_earned + ?, 2) "
-                        "WHERE user_id = ?",
-                        (bonus, bonus, ref_id),
+                        "UPDATE users SET refer_count = refer_count + 1 WHERE user_id = ?",
+                        (ref_id,),
                     )
                     conn.commit()
-                try:
-                    await context.bot.send_message(
-                        chat_id=ref_id,
-                        text=(
-                            "🎉 <b>নতুন রেফারেল বোনাস!</b>\n\n"
-                            f"👤 <b>{user.first_name}</b> আপনার লিংক থেকে জয়েন করেছে!\n"
-                            f"🎁 আপনার ওয়ালেটে <b>৳{bonus:.2f}</b> যোগ করা হয়েছে।"
-                        ),
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
 
     await show_main_dashboard(update, context)
 
 
 # ---------------------------------------------------------------------------
-# SMM Categories & New Order Flow
+# SMM Categories & Service Listing
 # ---------------------------------------------------------------------------
 def build_categories_keyboard() -> InlineKeyboardMarkup:
-    cats = list_categories()
+    cats = list_categories(include_disabled=False)
     rows = []
     for i in range(0, len(cats), 2):
         pair = cats[i : i + 2]
@@ -674,7 +1641,7 @@ def build_categories_keyboard() -> InlineKeyboardMarkup:
 
 
 async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cats = list_categories()
+    cats = list_categories(include_disabled=False)
     if not cats:
         msg = "⚠️ বর্তমানে কোনো সার্ভিস চালু নেই। অ্যাডমিন সার্ভিস অ্যাড করলে এখানে দেখা যাবে।"
         if update.message:
@@ -686,7 +1653,8 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     text = (
         "🚀 <b>VIP SMM নতুন অর্ডার প্যানেল</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "আপনি কোন ক্যাটাগরির সার্ভিস নিতে চান? নিচের বাটন থেকে সিলেক্ট করুন:"
+        "⏱️ <b>Average delivery time:</b> 2-6 hours\n"
+        "আপনি কোন প্ল্যাটফর্মের সার্ভিস নিতে চান? নিচের বাটন থেকে সিলেক্ট করুন:"
     )
     kb = build_categories_keyboard()
     if update.message:
@@ -697,26 +1665,46 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def show_all_services_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    services = list_services()
+    user_id = update.effective_user.id
+    admin_view = is_admin(user_id)
+    services = list_services(include_disabled=admin_view)
     if not services:
         await update.message.reply_text(
-            "কোনো সার্ভিস নেই।", reply_markup=main_menu(update.effective_user.id)
+            "কোনো সার্ভিস নেই।", reply_markup=main_menu(user_id)
         )
         return
-    lines = ["📋 <b>আমাদের সকল VIP SMM ও ফাইল সার্ভিস লিস্ট:</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
+    lines = [
+        "📋 <b>আমাদের সকল অ্যাক্টিভ SMM সার্ভিস লিস্ট:</b>\n"
+        "⏱️ <b>Average Time:</b> 2-6 hours\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    ]
     current_cat = None
     for s in services:
         if s["category"] != current_cat:
             current_cat = s["category"]
             lines.append(f"\n💠 <b>{current_cat}</b>")
-        if s["service_type"] == "file":
+        sell_rate = get_sell_rate_per_1k(s)
+        sell_str = _fmt_num(sell_rate)
+        pid = int(s["panel_service_id"] or 0)
+        refill_txt = get_refill_label(s)
+        avg_t = get_avg_time_label(s)
+        mm_txt = format_min_max(s, admin_view=admin_view)
+        bot_data_tag = " | 🤖 <b>Bot Data</b>" if "bot data" in (s["name"] + " " + s["description"]).lower() else ""
+        active_tag = "" if int(s["is_active"] or 0) == 1 else " [DISABLED]"
+        if admin_view:
+            p_rate = float(s["panel_rate"] or 0.0)
+            profit_1k = round(sell_rate - p_rate, 4) if p_rate > 0 else 0.0
             lines.append(
-                f"  ├─ 🆔 <b>#{s['id']}</b> {s['name']} — <b>৳{s['rate_per_1k']:.0f} (Fixed)</b>"
+                f"  ├─ 🆔 <b>#{s['id']}</b> {s['name']}{active_tag}\n"
+                f"  │    💰 Sell: <b>৳{sell_str}/1000</b> | Panel Rate: <b>{_fmt_num(p_rate)}/1000</b> | Profit: <b>{_fmt_num(profit_1k)}/1000</b>\n"
+                f"  │    🔗 Panel ID: <code>#{pid}</code> | 🔄 {refill_txt}{bot_data_tag} | ⏱️ {avg_t}\n"
+                f"  │    📊 {mm_txt}"
             )
         else:
             lines.append(
                 f"  ├─ 🆔 <b>#{s['id']}</b> {s['name']}\n"
-                f"  │    💰 রেট: <b>৳{s['rate_per_1k']:.0f} / 1K</b> | Min: {s['min_qty']} | Max: {s['max_qty']}"
+                f"  │    💰 মূল্য: <b>৳{sell_str} / 1000</b> | 🔄 {refill_txt}{bot_data_tag}\n"
+                f"  │    ⏱️ Average time: {avg_t} | 📊 {mm_txt}"
             )
     lines.append("\n👇 অর্ডার করতে <b>🚀 নতুন অর্ডার (SMM)</b> বাটনে চাপুন:")
     await update.message.reply_text(
@@ -726,6 +1714,9 @@ async def show_all_services_list(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
+# ---------------------------------------------------------------------------
+# 3. ORDER FLOW (Steps 1 to 7)
+# ---------------------------------------------------------------------------
 async def handle_category_And_service_cb(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -746,33 +1737,33 @@ async def handle_category_And_service_cb(
             idx = int(data.replace("cat_", "", 1))
         except ValueError:
             return
-        cats = list_categories()
+        cats = list_categories(include_disabled=False)
         if idx < 0 or idx >= len(cats):
             return
         cat_name = cats[idx]
-        svcs = list_services(cat_name)
+        svcs = list_services(cat_name, include_disabled=False)
         lines = [
             f"💠 <b>ক্যাটাগরি: {cat_name}</b>\n"
+            "⏱️ <b>Average time:</b> 2-6 hours\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "নিচ থেকে আপনার পছন্দের সার্ভিসটি সিলেক্ট করুন:\n"
         ]
         buttons = []
         for s in svcs:
-            if s["service_type"] == "file":
-                price_tag = f"৳{s['rate_per_1k']:.0f}"
-                lines.append(f"🔹 <b>{s['name']}</b>\n   💰 দাম: <b>{price_tag}</b> (Instant File)\n")
-            else:
-                price_tag = f"৳{s['rate_per_1k']:.0f}/1K"
-                lines.append(
-                    f"🔹 <b>{s['name']}</b>\n"
-                    f"   💰 রেট: <b>{price_tag}</b> | Min: {s['min_qty']} - Max: {s['max_qty']}\n"
-                )
+            sell_rate = get_sell_rate_per_1k(s)
+            sell_str = _fmt_num(sell_rate)
+            refill_tag = get_refill_label(s)
+            avg_t = get_avg_time_label(s)
+            mm_txt = format_min_max(s, admin_view=False)
+            bot_data_note = " | 🤖 Bot Data" if "bot data" in (s["name"] + " " + s["description"]).lower() else ""
+            lines.append(
+                f"🔹 <b>{s['name']}</b>\n"
+                f"   💰 মূল্য: <b>৳{sell_str}/1000</b> | 🔄 {refill_tag}{bot_data_note}\n"
+                f"   ⏱️ Avg Time: {avg_t} | {mm_txt}\n"
+            )
+            btn_label = f"🛒 {s['name']} (৳{sell_str}/1K • {refill_tag})"
             buttons.append(
-                [
-                    InlineKeyboardButton(
-                        f"🛒 {s['name']} ({price_tag})", callback_data=f"srv_{s['id']}"
-                    )
-                ]
+                [InlineKeyboardButton(btn_label, callback_data=f"srv_{s['id']}")]
             )
         buttons.append([InlineKeyboardButton("🔙 ক্যাটাগরি লিস্টে ফিরুন", callback_data="open_cats")])
         await query.edit_message_text(
@@ -782,55 +1773,68 @@ async def handle_category_And_service_cb(
         )
         return
 
+    # Step 1: User selects service -> check panel_service_id is not 0 and Panel API is set
     if data.startswith("srv_"):
         try:
             sid = int(data.replace("srv_", "", 1))
         except ValueError:
             return
         s = get_service(sid)
-        if not s:
-            await query.edit_message_text("⚠️ সার্ভিসটি পাওয়া যায়নি।")
+        if not s or int(s["is_active"] or 0) == 0:
+            await query.edit_message_text("⚠️ সার্ভিসটি বর্তমানে চালু নেই।")
             return
 
-        if s["service_type"] == "file":
-            text = (
-                f"📁 <b>প্রিমিয়াম ফাইল প্রোডাক্ট</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📦 <b>নাম:</b> {s['name']}\n"
-                f"💰 <b>মূল্য:</b> ৳{s['rate_per_1k']:.2f}\n"
-                f"📝 <b>বিবরণ:</b> {s['description']}\n"
-                f"💳 <b>আপনার ব্যালেন্স:</b> ৳{get_balance(query.from_user.id):.2f}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "কেনার সাথে সাথে বট অটোমেটিক ফাইল ডেলিভারি করবে!"
+        pid = int(s["panel_service_id"] or 0)
+        if pid <= 0:
+            await query.edit_message_text(
+                "⚠️ এই সার্ভিসটি বর্তমানে অর্ডারের জন্য উপলব্ধ নয়।",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔙 ক্যাটাগরি লিস্টে ফিরুন", callback_data="open_cats")]]
+                ),
             )
-            kb = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            f"✅ এখনই কিনুন (৳{s['rate_per_1k']:.0f})",
-                            callback_data=f"buyfile_{s['id']}",
-                        )
-                    ],
-                    [InlineKeyboardButton("🔙 পেছনে যান", callback_data="open_cats")],
-                ]
-            )
-            await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
             return
 
-        # SMM Service Selected -> Ask for Target Link
+        # Check SMM_API_URL and SMM_API_KEY
+        api_url, api_key = _get_smm_api_config()
+        if not api_url or not api_key:
+            await query.edit_message_text(
+                "⚠️ <b>Panel API not set - contact admin</b>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔙 ক্যাটাগরি লিস্টে ফিরুন", callback_data="open_cats")]]
+                ),
+            )
+            return
+
+        sell_rate = get_sell_rate_per_1k(s)
+        sell_str = _fmt_num(sell_rate)
+        refill_txt = get_refill_label(s)
+        avg_t = get_avg_time_label(s)
+        mm_txt = format_min_max(s, admin_view=False)
+        req_plat = detect_required_platform(s["category"], s["name"])
+        plat_hint = f" ({req_plat[0]})" if req_plat else ""
+        bot_data_line = (
+            "🤖 <b>টাইপ:</b> Bot Data\n"
+            if "bot data" in (s["name"] + " " + s["description"]).lower()
+            else ""
+        )
+
         context.user_data.clear()
         context.user_data["state"] = ST_ORDER_LINK
         context.user_data["order_service_id"] = s["id"]
         text = (
             f"🚀 <b>সার্ভিস: {s['name']}</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 <b>রেট (প্রতি ১০০০):</b> ৳{s['rate_per_1k']:.2f}\n"
-            f"📉 <b>সর্বনিম্ন অর্ডার:</b> {s['min_qty']}\n"
-            f"📈 <b>সর্বোচ্চ অর্ডার:</b> {s['max_qty']}\n"
-            f"📝 <b>বিবরণ:</b> {s['description']}\n"
+            f"🆔 <b>Panel Service ID:</b> <code>#{pid}</code>\n"
+            f"💰 <b>মূল্য (প্রতি ১০০০):</b> <b>৳{sell_str}</b>\n"
+            f"📊 <b>লিমিট:</b> {mm_txt}\n"
+            f"🔄 <b>রিফিল:</b> {refill_txt}\n"
+            f"⏱️ <b>Average time:</b> {avg_t}\n"
+            f"{bot_data_line}"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔗 <b>ধাপ ১/২:</b> আপনার <b>প্রোফাইল / পোস্ট / ভিডিও লিংক (Link)</b> পাঠান:\n"
-            "<i>(অবশ্যই অ্যাকাউন্ট বা পোস্ট Public থাকতে হবে)</i>"
+            f"🔗 <b>ধাপ ১/৩:</b> আপনার <b>টার্গেট লিংক{plat_hint}</b> পাঠান:\n"
+            "<i>(লিংক অবশ্যই http:// বা https:// দিয়ে শুরু হতে হবে এবং পাবলিক থাকতে হবে)</i>"
         )
         await query.edit_message_text(text, parse_mode="HTML")
         await context.bot.send_message(
@@ -840,25 +1844,58 @@ async def handle_category_And_service_cb(
         )
         return
 
-    if data.startswith("buyfile_"):
-        try:
-            sid = int(data.replace("buyfile_", "", 1))
-        except ValueError:
-            return
-        s = get_service(sid)
-        if not s:
-            await query.edit_message_text("⚠️ প্রোডাক্ট পাওয়া যায়নি।")
-            return
+    # Step 5, 6, 7: Order Confirm / Cancel Callback
+    if data == "order_cancel_cb":
+        context.user_data.clear()
+        await query.edit_message_text("❌ অর্ডারটি বাতিল করা হয়েছে। আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি।")
+        return
+
+    if data == "order_confirm_cb":
         user = query.from_user
-        price = round(float(s["rate_per_1k"]), 2)
-        bal = get_balance(user.id)
-        if bal < price:
+        if context.user_data.get("state") != ST_ORDER_CONFIRM:
+            await query.edit_message_text("⚠️ অর্ডার সেশনটির মেয়াদ শেষ হয়েছে। অনুগ্রহ করে নতুন করে অর্ডার করুন।")
+            return
+
+        sid = int(context.user_data.get("order_service_id", 0))
+        link = str(context.user_data.get("order_link", "")).strip()
+        qty = int(context.user_data.get("order_qty", 0))
+        context.user_data.clear()
+
+        s = get_service(sid)
+        if not s or int(s["is_active"] or 0) == 0:
+            await query.edit_message_text("⚠️ সার্ভিসটি পাওয়া যায়নি। কোনো টাকা কাটা হয়নি।")
+            return
+
+        pid = int(s["panel_service_id"] or 0)
+        if pid <= 0:
+            await query.edit_message_text("⚠️ সার্ভিসটি প্যানেলের সাথে যুক্ত নয়। কোনো টাকা কাটা হয়নি।")
+            return
+
+        # Check API env vars first
+        api_url, api_key = _get_smm_api_config()
+        if not api_url or not api_key:
             await query.edit_message_text(
-                f"⚠️ <b>পর্যাপ্ত ব্যালেন্স নেই!</b>\n\n"
-                f"📦 প্রোডাক্ট: {s['name']}\n"
-                f"💰 প্রয়োজন: <b>৳{price:.2f}</b>\n"
-                f"💳 আপনার ব্যালেন্স: <b>৳{bal:.2f}</b>\n\n"
-                "দয়া করে আগে <b>💰 ডিপোজিট</b> বাটনে চাপ দিয়ে ব্যালেন্স অ্যাড করুন।",
+                "⚠️ <b>Panel API not set - contact admin</b>\nআপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি।",
+                parse_mode="HTML",
+            )
+            return
+
+        sell_price = calc_sell_price(s, qty)
+        panel_cost = calc_panel_cost(s, qty)
+
+        # Step 5a: Check user wallet balance
+        user_bal = get_balance(user.id)
+        if user_bal < sell_price:
+            needed = round(sell_price - user_bal, 2)
+            await query.edit_message_text(
+                "⚠️ <b>আপনার ওয়ালেটে পর্যাপ্ত ব্যালেন্স নেই!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 সার্ভিস: {s['name']}\n"
+                f"🔢 পরিমাণ: {qty}\n"
+                f"💰 প্রয়োজন: <b>৳{sell_price:.2f}</b>\n"
+                f"💳 আপনার ব্যালেন্স: <b>৳{user_bal:.2f}</b>\n"
+                f"❗ আরও প্রয়োজন: <b>৳{needed:.2f}</b>\n\n"
+                "আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি। দয়া করে আগে ডিপোজিট করুন।",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("💰 এখনই ডিপোজিট করুন", callback_data="open_deposit")]]
@@ -866,51 +1903,103 @@ async def handle_category_And_service_cb(
             )
             return
 
-        new_bal = add_balance(user.id, -price)
-        record_spend(user.id, price)
-        status = "completed" if s["file_id"] else "pending"
+        # Step 5b: Check panel_balance() is enough for panel_cost
+        pbal_res = panel_balance()
+        if not pbal_res.get("ok"):
+            await query.edit_message_text(
+                f"⚠️ <b>প্যানেল ব্যালেন্স যাচাই করা যায়নি:</b> {pbal_res.get('error')}\n"
+                "আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি।",
+                parse_mode="HTML",
+            )
+            return
+
+        if float(pbal_res.get("balance", 0.0)) < panel_cost or (
+            panel_cost == 0.0 and float(pbal_res.get("balance", 0.0)) <= 0.0
+        ):
+            await query.edit_message_text(
+                "⚠️ <b>সার্ভার প্যানেলে পর্যাপ্ত ব্যালেন্স নেই। অ্যাডমিনের সাথে যোগাযোগ করুন।</b>\n"
+                "আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি।",
+                parse_mode="HTML",
+            )
+            return
+
+        # Step 6: Call panel_add_order()
+        await query.edit_message_text("⏳ প্যানেলে অর্ডার পাঠানো হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...")
+        add_res = panel_add_order(pid, link, qty)
+        if not add_res.get("ok"):
+            err_msg = add_res.get("error", "Unknown panel error")
+            await query.edit_message_text(
+                f"❌ <b>প্যানেল অর্ডার গ্রহণ করেনি:</b>\n<code>{err_msg}</code>\n\n"
+                "💳 আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি।",
+                parse_mode="HTML",
+            )
+            return
+
+        panel_oid = int(add_res["order"])
+
+        # Step 7: Only after panel success -> deduct wallet, save order, notify admin, backup to Google Sheets
+        new_bal = add_balance(
+            user.id, -sell_price, reason=f"Order Placed ({s['name']} x{qty})"
+        )
+        record_spend(user.id, sell_price)
         with _db_lock, db() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO orders
-                (service_id, service_name, buyer_id, buyer_name, target_link, quantity, price, status)
-                VALUES (?, ?, ?, ?, 'Instant File Delivery', 1, ?, ?)
+                (service_id, service_name, buyer_id, buyer_name, target_link, quantity,
+                 price, status, panel_order_id, panel_service_id, panel_cost, sell_price,
+                 starts_count, remains, refunded, refer_bonus_paid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?, ?, ?, 0, ?, 0, 0)
                 """,
-                (s["id"], s["name"], user.id, user.first_name or "User", price, status),
+                (
+                    s["id"],
+                    s["name"],
+                    user.id,
+                    user.first_name or "User",
+                    link,
+                    qty,
+                    sell_price,
+                    panel_oid,
+                    pid,
+                    panel_cost,
+                    sell_price,
+                    qty,
+                ),
             )
             order_id = cur.lastrowid
             conn.commit()
 
-        if s["file_id"]:
-            try:
-                await context.bot.send_document(
-                    chat_id=user.id,
-                    document=s["file_id"],
-                    caption=(
-                        f"✅ <b>অর্ডার সফল! (#SMM-{order_id})</b>\n"
-                        f"📦 প্রোডাক্ট: {s['name']}\n"
-                        f"💰 কর্তন: ৳{price:.2f} | নতুন ব্যালেন্স: ৳{new_bal:.2f}"
-                    ),
-                    parse_mode="HTML",
-                )
-                await query.edit_message_text(
-                    f"✅ <b>#SMM-{order_id}</b> অটোমেটিক ডেলিভারি সম্পন্ন হয়েছে! নিচে আপনার ফাইলটি ডাউনলোড করুন।",
-                    parse_mode="HTML",
-                )
-                return
-            except Exception as exc:
-                logger.warning("Instant file send failed: %s", exc)
+        schedule_order_sheet_backup(order_id)
 
         await query.edit_message_text(
-            f"✅ <b>অর্ডার রিসিভ হয়েছে! (#SMM-{order_id})</b>\n"
-            f"📦 প্রোডাক্ট: {s['name']}\n"
-            f"💰 দাম: ৳{price:.2f}\n\n"
-            "অ্যাডমিন দ্রুত আপনার অর্ডারটি ডেলিভারি করবেন।",
+            "🎉 <b>আপনার অর্ডার সফলভাবে প্যানেলে সাবমিট হয়েছে!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧾 <b>Bot Order ID:</b> <code>#SMM-{order_id}</code>\n"
+            f"🌐 <b>Panel Order ID:</b> <code>#{panel_oid}</code>\n"
+            f"📦 <b>সার্ভিস:</b> {s['name']} (Service #{pid})\n"
+            f"🔗 <b>লিংক:</b> <code>{link}</code>\n"
+            f"🔢 <b>পরিমাণ:</b> {qty}\n"
+            f"💰 <b>মোট চার্জ:</b> ৳{sell_price:.2f}\n"
+            f"💳 <b>নতুন ব্যালেন্স:</b> ৳{new_bal:.2f}\n"
+            f"⏱️ <b>Average time:</b> {get_avg_time_label(s)}\n"
+            "⏳ <b>স্ট্যাটাস:</b> Pending\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📦 <b>আমার অর্ডার</b> মেনু থেকে যেকোনো সময় লাইভ স্ট্যাটাস চেক করতে পারবেন।",
             parse_mode="HTML",
         )
         await notify_admin_new_order(
-            context, order_id, s["name"], user, "Instant File Product", 1, price
+            context,
+            order_id,
+            s["name"],
+            user,
+            link,
+            qty,
+            sell_price,
+            panel_order_id=panel_oid,
+            panel_service_id=pid,
+            panel_cost=panel_cost,
         )
+        return
 
 
 async def notify_admin_new_order(
@@ -921,11 +2010,27 @@ async def notify_admin_new_order(
     link: str,
     qty: int,
     price: float,
+    panel_order_id: int = 0,
+    panel_service_id: int = 0,
+    panel_cost: float = 0.0,
 ) -> None:
     aid = _admin_id()
     if not aid:
         return
-    kb = InlineKeyboardMarkup(
+    profit = round(price - panel_cost, 2) if panel_cost > 0 else price
+    kb_rows = []
+    if panel_order_id > 0:
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    "🔄 Check Panel Status", callback_data=f"adm_chk_{order_id}"
+                ),
+                InlineKeyboardButton(
+                    "💸 Refund Order", callback_data=f"adm_ref_{order_id}"
+                ),
+            ]
+        )
+    kb_rows.extend(
         [
             [
                 InlineKeyboardButton("⚙️ Processing", callback_data=f"ord_proc_{order_id}"),
@@ -944,20 +2049,317 @@ async def notify_admin_new_order(
             text=(
                 "🔔 <b>নতুন SMM অর্ডার এসেছে!</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🧾 <b>Order ID:</b> <code>#SMM-{order_id}</code>\n"
+                f"🧾 <b>Bot Order ID:</b> <code>#SMM-{order_id}</code>\n"
+                f"🌐 <b>Panel Order ID:</b> <code>#{panel_order_id}</code> (Service #{panel_service_id})\n"
                 f"📦 <b>সার্ভিস:</b> {service_name}\n"
                 f"🔗 <b>লিংক:</b> <code>{link}</code>\n"
                 f"🔢 <b>পরিমাণ (Quantity):</b> {qty}\n"
-                f"💰 <b>পেমেন্ট:</b> ৳{price:.2f} (Paid from Wallet)\n"
+                f"💰 <b>Sell Price:</b> ৳{price:.2f} | <b>Panel Cost:</b> {panel_cost:.4f} | <b>Profit:</b> ৳{profit:.2f}\n"
                 f"👤 <b>ক্রেতা:</b> {user.first_name} (ID: <code>{user.id}</code>)\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "👇 অর্ডারের স্ট্যাটাস আপডেট করতে নিচের বাটনে চাপুন:"
+                "👇 অর্ডারের স্ট্যাটাস চেক বা আপডেট করতে নিচের বাটনে চাপুন:"
             ),
             parse_mode="HTML",
-            reply_markup=kb,
+            reply_markup=InlineKeyboardMarkup(kb_rows),
         )
     except Exception as exc:
         logger.warning("Failed to notify admin of order: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Step 8 & Step 9: Check Order Status & Refill (User & Admin Sync Helper)
+# ---------------------------------------------------------------------------
+async def sync_order_with_panel(
+    order_id: int, context: ContextTypes.DEFAULT_TYPE
+) -> tuple[bool, str, sqlite3.Row | None]:
+    """
+    Calls panel_status(panel_order_id), updates the order row in SQLite,
+    credits 10% referral bonus on Completed, and performs automatic refunds on Partial or Cancelled.
+    """
+    with _db_lock, db() as conn:
+        order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if not order:
+        return (False, "⚠️ অর্ডারটি পাওয়া যায়নি।", None)
+
+    panel_oid = int(order["panel_order_id"] or 0)
+    if panel_oid <= 0:
+        return (False, "ℹ️ এই অর্ডারটির কোনো Panel Order ID নেই।", order)
+
+    st_res = panel_status(panel_oid)
+    if not st_res.get("ok"):
+        return (
+            False,
+            f"⚠️ প্যানেল স্ট্যাটাস চেক ব্যর্থ হয়েছে: {st_res.get('error')}",
+            order,
+        )
+
+    mapped_st = st_res["status"]  # Pending | Processing | Completed | Partial | Cancelled
+    starts_cnt = int(st_res.get("starts_count", 0))
+    remains = int(st_res.get("remains", 0))
+    prev_st = str(order["status"] or "Pending")
+    already_refunded = int(order["refunded"] or 0) == 1
+    sell_price = float(order["sell_price"] or order["price"] or 0.0)
+    qty = max(1, int(order["quantity"] or 1))
+    buyer_id = int(order["buyer_id"])
+
+    refund_msg = ""
+    if mapped_st == "Completed" and prev_st.lower() != "completed":
+        with _db_lock, db() as conn:
+            conn.execute(
+                "UPDATE orders SET status = 'Completed', starts_count = ?, remains = 0 WHERE id = ?",
+                (starts_cnt, order_id),
+            )
+            conn.commit()
+        await credit_referral_on_completed_order(order_id, context)
+        schedule_order_sheet_backup(order_id)
+        try:
+            await context.bot.send_message(
+                chat_id=buyer_id,
+                text=(
+                    f"🎉 <b>আপনার অর্ডার সম্পন্ন হয়েছে! (#SMM-{order_id})</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🌐 <b>Panel Order ID:</b> <code>#{panel_oid}</code>\n"
+                    f"📦 <b>সার্ভিস:</b> {order['service_name']}\n"
+                    f"🔢 <b>পরিমাণ:</b> {qty} | ▶️ Start Count: {starts_cnt}\n"
+                    "✨ <b>স্ট্যাটাস:</b> ✅ Completed"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    elif mapped_st == "Partial" and not already_refunded:
+        rem_clamped = max(0, min(qty, remains))
+        refund_amt = round(sell_price * (rem_clamped / float(qty)), 2)
+        new_bal = get_balance(buyer_id)
+        with _db_lock, db() as conn:
+            conn.execute(
+                "UPDATE orders SET status = 'Partial', starts_count = ?, remains = ?, refunded = 1 WHERE id = ?",
+                (starts_cnt, rem_clamped, order_id),
+            )
+            conn.commit()
+        if refund_amt > 0:
+            new_bal = add_balance(
+                buyer_id,
+                refund_amt,
+                reason=f"Partial Order Refund #SMM-{order_id}",
+            )
+        schedule_order_sheet_backup(order_id)
+        refund_msg = (
+            f"\n⚠️ <b>Partial Order!</b> বাকি ছিল (Remains): <b>{rem_clamped}</b>\n"
+            f"💰 আনডেলিভারড অংশের <b>৳{refund_amt:.2f}</b> ওয়ালেটে রিফান্ড করা হয়েছে (ব্যালেন্স: ৳{new_bal:.2f})।"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=buyer_id,
+                text=(
+                    f"⚠️ <b>অর্ডার আংশিক সম্পন্ন ও রিফান্ড (#SMM-{order_id})</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🌐 <b>Panel Order ID:</b> <code>#{panel_oid}</code>\n"
+                    f"📦 <b>সার্ভিস:</b> {order['service_name']}\n"
+                    f"🔢 <b>অর্ডার পরিমাণ:</b> {qty} | 📉 <b>বাকি (Remains):</b> {rem_clamped}\n"
+                    f"💰 <b>রিফান্ড:</b> +৳{refund_amt:.2f} ওয়ালেটে ফেরত দেওয়া হয়েছে।\n"
+                    f"💳 <b>বর্তমান ব্যালেন্স:</b> ৳{new_bal:.2f}"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    elif mapped_st == "Cancelled" and not already_refunded:
+        with _db_lock, db() as conn:
+            conn.execute(
+                "UPDATE orders SET status = 'Cancelled', starts_count = ?, remains = ?, refunded = 1 WHERE id = ?",
+                (starts_cnt, remains, order_id),
+            )
+            conn.commit()
+        new_bal = add_balance(
+            buyer_id,
+            sell_price,
+            reason=f"Cancelled Order Refund #SMM-{order_id}",
+        )
+        schedule_order_sheet_backup(order_id)
+        refund_msg = (
+            f"\n❌ <b>Cancelled by Panel!</b> সম্পূর্ণ <b>৳{sell_price:.2f}</b> ওয়ালেটে রিফান্ড করা হয়েছে (ব্যালেন্স: ৳{new_bal:.2f})।"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=buyer_id,
+                text=(
+                    f"❌ <b>অর্ডার বাতিল ও সম্পূর্ণ রিফান্ড (#SMM-{order_id})</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🌐 <b>Panel Order ID:</b> <code>#{panel_oid}</code>\n"
+                    f"📦 <b>সার্ভিস:</b> {order['service_name']}\n"
+                    f"💰 <b>রিফান্ড:</b> +৳{sell_price:.2f} আপনার ওয়ালেটে ফেরত দেওয়া হয়েছে।\n"
+                    f"💳 <b>বর্তমান ব্যালেন্স:</b> ৳{new_bal:.2f}"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    else:
+        with _db_lock, db() as conn:
+            conn.execute(
+                "UPDATE orders SET status = ?, starts_count = ?, remains = ? WHERE id = ?",
+                (mapped_st, starts_cnt, remains, order_id),
+            )
+            conn.commit()
+        schedule_order_sheet_backup(order_id)
+
+    with _db_lock, db() as conn:
+        updated_order = conn.execute(
+            "SELECT * FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+
+    summary = (
+        f"🧾 <b>Order #SMM-{order_id}</b> (Panel <code>#{panel_oid}</code>)\n"
+        f"📦 <b>সার্ভিস:</b> {order['service_name']}\n"
+        f"📊 <b>বর্তমান স্ট্যাটাস:</b> <b>{mapped_st}</b>\n"
+        f"▶️ <b>Start Count:</b> {starts_cnt} | 📉 <b>Remains:</b> {remains}"
+        f"{refund_msg}"
+    )
+    return (True, summary, updated_order)
+
+
+def build_user_order_keyboard(order: sqlite3.Row, service: sqlite3.Row | None) -> InlineKeyboardMarkup | None:
+    """
+    Builds inline buttons for an order in My Orders:
+      - Step 8: "Check Order Status" button
+      - Step 9: "Refill" button ONLY if refill_enabled = 1 and status is Completed.
+        Never show a Refill button for No Refill services.
+    """
+    oid = order["id"]
+    panel_oid = int(order["panel_order_id"] or 0)
+    if panel_oid <= 0:
+        return None
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "🔄 Check Order Status", callback_data=f"usr_chk_{oid}"
+            )
+        ]
+    ]
+    refill_en = int(service["refill_enabled"] or 0) if service else 0
+    st_norm = str(order["status"] or "").strip().lower()
+    if refill_en == 1 and st_norm == "completed":
+        r_label = get_refill_label(service) if service else "Refill"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"♻️ Report Drop & Refill ({r_label})",
+                    callback_data=f"usr_drop_{oid}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(buttons)
+
+
+async def handle_user_order_actions_cb(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    user = query.from_user
+
+    if data.startswith("usr_chk_"):
+        try:
+            oid = int(data.replace("usr_chk_", "", 1))
+        except ValueError:
+            return
+        with _db_lock, db() as conn:
+            order = conn.execute(
+                "SELECT * FROM orders WHERE id = ? AND buyer_id = ?", (oid, user.id)
+            ).fetchone()
+        if not order:
+            await query.edit_message_text("⚠️ অর্ডারটি পাওয়া যায়নি।")
+            return
+
+        ok, summary, updated = await sync_order_with_panel(oid, context)
+        svc = get_service(updated["service_id"]) if updated else None
+        kb = build_user_order_keyboard(updated, svc) if updated else None
+        await query.edit_message_text(summary, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if data.startswith("usr_drop_"):
+        try:
+            oid = int(data.replace("usr_drop_", "", 1))
+        except ValueError:
+            return
+        with _db_lock, db() as conn:
+            order = conn.execute(
+                "SELECT * FROM orders WHERE id = ? AND buyer_id = ?", (oid, user.id)
+            ).fetchone()
+        if not order:
+            await query.edit_message_text("⚠️ অর্ডারটি পাওয়া যায়নি।")
+            return
+        svc = get_service(order["service_id"])
+        if not svc or int(svc["refill_enabled"] or 0) != 1:
+            await query.edit_message_text("⚠️ এই সার্ভিসটিতে রিফিল সুবিধা নেই (No Refill)।")
+            return
+        if str(order["status"] or "").strip().lower() != "completed":
+            await query.edit_message_text("⚠️ শুধুমাত্র Completed অর্ডারে ড্রপ হলে রিফিল করা যাবে।")
+            return
+
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "♻️ Confirm Refill Now", callback_data=f"usr_refill_{oid}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 Back to Order", callback_data=f"usr_chk_{oid}"
+                    )
+                ],
+            ]
+        )
+        await query.edit_message_text(
+            f"♻️ <b>Refill Request (#SMM-{oid})</b>\n"
+            f"🌐 Panel Order ID: <code>#{order['panel_order_id']}</code>\n"
+            f"📦 সার্ভিস: {order['service_name']} ({get_refill_label(svc)})\n\n"
+            "আপনার অর্ডারে কি ড্রপ হয়েছে? নিচের বাটনে চাপ দিলে প্যানেলে অটোমেটিক Refill রিকোয়েস্ট পাঠানো হবে:",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return
+
+    if data.startswith("usr_refill_"):
+        try:
+            oid = int(data.replace("usr_refill_", "", 1))
+        except ValueError:
+            return
+        with _db_lock, db() as conn:
+            order = conn.execute(
+                "SELECT * FROM orders WHERE id = ? AND buyer_id = ?", (oid, user.id)
+            ).fetchone()
+        if not order:
+            await query.edit_message_text("⚠️ অর্ডারটি পাওয়া যায়নি।")
+            return
+        svc = get_service(order["service_id"])
+        if not svc or int(svc["refill_enabled"] or 0) != 1:
+            await query.edit_message_text("⚠️ এই সার্ভিসটিতে রিফিল সুবিধা নেই (No Refill)।")
+            return
+        if str(order["status"] or "").strip().lower() != "completed":
+            await query.edit_message_text("⚠️ শুধুমাত্র Completed অর্ডারে রিফিল করা যাবে।")
+            return
+
+        ref_res = panel_refill(int(order["panel_order_id"]))
+        if ref_res.get("ok"):
+            await query.edit_message_text(
+                f"✅ <b>Refill রিকোয়েস্ট সফল! (#SMM-{oid})</b>\n"
+                f"🌐 Panel Order ID: <code>#{order['panel_order_id']}</code>\n"
+                f"🆔 Refill ID: <code>{ref_res.get('refill')}</code>",
+                parse_mode="HTML",
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ <b>প্যানেল রিফিল গ্রহণ করেনি:</b>\n<code>{ref_res.get('error')}</code>",
+                parse_mode="HTML",
+            )
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -1014,8 +2416,45 @@ async def handle_deposit_method_cb(
 
 
 # ---------------------------------------------------------------------------
-# Admin Order & Deposit Decision Callbacks
+# Admin Order, Deposit & CSV Export Callbacks
 # ---------------------------------------------------------------------------
+def _build_admin_order_kb(order_id: int, panel_order_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    if panel_order_id > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🔄 Check Panel Status", callback_data=f"adm_chk_{order_id}"
+                ),
+                InlineKeyboardButton(
+                    "💸 Refund Order", callback_data=f"adm_ref_{order_id}"
+                ),
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "💸 Refund Order", callback_data=f"adm_ref_{order_id}"
+                )
+            ]
+        )
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton("⚙️ Processing", callback_data=f"ord_proc_{order_id}"),
+                InlineKeyboardButton("✅ Completed", callback_data=f"ord_comp_{order_id}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel & Refund", callback_data=f"ord_canc_{order_id}"
+                )
+            ],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
 async def handle_admin_decisions_cb(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1026,6 +2465,80 @@ async def handle_admin_decisions_cb(
         return
 
     data = query.data or ""
+
+    # Admin: Export All Users CSV
+    if data == "adm_export_users":
+        await send_all_users_csv(query.from_user.id, context)
+        return
+
+    # Admin: Check Panel Status button
+    if data.startswith("adm_chk_"):
+        try:
+            oid = int(data.replace("adm_chk_", "", 1))
+        except ValueError:
+            return
+        ok, summary, updated = await sync_order_with_panel(oid, context)
+        if updated:
+            p_cost = float(updated["panel_cost"] or 0.0)
+            s_price = float(updated["sell_price"] or updated["price"] or 0.0)
+            profit = round(s_price - p_cost, 2) if p_cost > 0 else s_price
+            summary += (
+                f"\n💰 <b>Sell:</b> ৳{s_price:.2f} | <b>Panel Cost:</b> {p_cost:.4f} | <b>Profit:</b> ৳{profit:.2f}"
+            )
+            kb = _build_admin_order_kb(oid, int(updated["panel_order_id"] or 0))
+            await query.edit_message_text(summary, parse_mode="HTML", reply_markup=kb)
+        else:
+            await query.edit_message_text(summary, parse_mode="HTML")
+        return
+
+    # Admin: Refund Order button (refunds sell price to user wallet and marks order Cancelled)
+    if data.startswith("adm_ref_"):
+        try:
+            oid = int(data.replace("adm_ref_", "", 1))
+        except ValueError:
+            return
+        with _db_lock, db() as conn:
+            order = conn.execute("SELECT * FROM orders WHERE id = ?", (oid,)).fetchone()
+            if not order:
+                await query.edit_message_text("⚠️ অর্ডার পাওয়া যায়নি।")
+                return
+            if int(order["refunded"] or 0) == 1 or str(order["status"]).lower() == "cancelled":
+                await query.edit_message_text(
+                    f"ℹ️ Order #SMM-{oid} ইতিমধ্যে Cancelled / Refunded করা হয়েছে।"
+                )
+                return
+            conn.execute(
+                "UPDATE orders SET status = 'Cancelled', refunded = 1 WHERE id = ?",
+                (oid,),
+            )
+            conn.commit()
+
+        refund = float(order["sell_price"] or order["price"] or 0.0)
+        new_bal = add_balance(
+            order["buyer_id"], refund, reason=f"Admin Refund #SMM-{oid}"
+        )
+        schedule_order_sheet_backup(oid)
+        await query.edit_message_text(
+            f"💸 <b>Order #SMM-{oid} (Panel #{order['panel_order_id']}) Cancelled & Refunded!</b>\n"
+            f"💰 <b>৳{refund:.2f}</b> ক্রেতার ওয়ালেটে ফেরত দেওয়া হয়েছে (নতুন ব্যালেন্স: ৳{new_bal:.2f})।",
+            parse_mode="HTML",
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=order["buyer_id"],
+                text=(
+                    f"❌ <b>অর্ডার বাতিল ও রিফান্ড (#SMM-{oid})</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🌐 <b>Panel Order ID:</b> <code>#{order['panel_order_id']}</code>\n"
+                    f"📦 <b>সার্ভিস:</b> {order['service_name']}\n"
+                    f"💰 <b>রিফান্ড:</b> <b>+৳{refund:.2f}</b> আপনার ওয়ালেটে ফেরত দেওয়া হয়েছে।\n"
+                    f"💳 <b>বর্তমান ব্যালেন্স:</b> <b>৳{new_bal:.2f}</b>"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
 
     # Deposit Approve / Reject
     if data.startswith("approve_bal_") or data.startswith("reject_bal_"):
@@ -1051,7 +2564,12 @@ async def handle_admin_decisions_cb(
             conn.commit()
 
         if is_app:
-            new_bal = add_balance(row["buyer_id"], float(row["amount"]), is_deposit=True)
+            new_bal = add_balance(
+                row["buyer_id"],
+                float(row["amount"]),
+                is_deposit=True,
+                reason=f"Deposit Approved #{req_id} ({row['method']} - {row['trxid']})",
+            )
             await query.edit_message_text(
                 f"✅ <b>Deposit #{req_id} Approved!</b>\n"
                 f"👤 User ID: <code>{row['buyer_id']}</code>\n"
@@ -1109,29 +2627,19 @@ async def handle_admin_decisions_cb(
             if not order:
                 await query.edit_message_text("⚠️ অর্ডার পাওয়া যায়নি।")
                 return
-            if order["status"] in ("completed", "cancelled"):
+            if str(order["status"]).lower() in ("completed", "cancelled"):
                 await query.edit_message_text(
                     f"ℹ️ Order #SMM-{oid} ইতিমধ্যে {order['status']} করা হয়েছে।"
                 )
                 return
 
             if action == "proc":
-                conn.execute("UPDATE orders SET status = 'processing' WHERE id = ?", (oid,))
+                conn.execute("UPDATE orders SET status = 'Processing' WHERE id = ?", (oid,))
                 conn.commit()
-                kb = InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "✅ Completed", callback_data=f"ord_comp_{oid}"
-                            ),
-                            InlineKeyboardButton(
-                                "❌ Cancel & Refund", callback_data=f"ord_canc_{oid}"
-                            ),
-                        ]
-                    ]
-                )
+                schedule_order_sheet_backup(oid)
+                kb = _build_admin_order_kb(oid, int(order["panel_order_id"] or 0))
                 await query.edit_message_text(
-                    f"⚙️ <b>Order #SMM-{oid} এখন Processing-এ আছে।</b>\n"
+                    f"⚙️ <b>Order #SMM-{oid} (Panel #{order['panel_order_id']}) এখন Processing-এ আছে।</b>\n"
                     f"📦 {order['service_name']}\n"
                     f"🔗 <code>{order['target_link']}</code>\n"
                     f"🔢 Qty: {order['quantity']} | 💰 ৳{order['price']:.2f}",
@@ -1143,8 +2651,9 @@ async def handle_admin_decisions_cb(
                         chat_id=order["buyer_id"],
                         text=(
                             f"⚙️ <b>অর্ডার আপডেট (#SMM-{oid})</b>\n"
+                            f"🌐 Panel Order ID: <code>#{order['panel_order_id']}</code>\n"
                             f"📦 সার্ভিস: {order['service_name']}\n"
-                            "🚀 আপনার অর্ডারটির কাজ শুরু হয়েছে (<b>Processing</b>)!"
+                            "🚀 আপনার অর্ডারটির কাজ চলছে (<b>Processing</b>)!"
                         ),
                         parse_mode="HTML",
                     )
@@ -1153,63 +2662,66 @@ async def handle_admin_decisions_cb(
                 return
 
             if action == "comp":
-                conn.execute("UPDATE orders SET status = 'completed' WHERE id = ?", (oid,))
+                conn.execute("UPDATE orders SET status = 'Completed' WHERE id = ?", (oid,))
                 conn.commit()
-                svc = get_service(order["service_id"])
-                if svc and svc["file_id"]:
-                    try:
-                        await context.bot.send_document(
-                            chat_id=order["buyer_id"],
-                            document=svc["file_id"],
-                            caption=f"✅ Order #SMM-{oid} Completed!\n📦 {order['service_name']}",
-                        )
-                    except Exception:
-                        pass
-                await query.edit_message_text(
-                    f"✅ <b>Order #SMM-{oid} সফলভাবে Completed করা হয়েছে!</b>",
-                    parse_mode="HTML",
-                )
-                try:
-                    await context.bot.send_message(
-                        chat_id=order["buyer_id"],
-                        text=(
-                            f"🎉 <b>অর্ডার সম্পন্ন হয়েছে! (#SMM-{oid})</b>\n"
-                            "━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📦 সার্ভিস: {order['service_name']}\n"
-                            f"🔢 পরিমাণ: {order['quantity']}\n"
-                            "✨ স্ট্যাটাস: <b>✅ Completed</b>\n\n"
-                            "আমাদের সাথে থাকার জন্য ধন্যবাদ!"
-                        ),
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-                return
 
-            if action == "canc":
-                conn.execute("UPDATE orders SET status = 'cancelled' WHERE id = ?", (oid,))
-                conn.commit()
-                refund = float(order["price"])
-                new_bal = add_balance(order["buyer_id"], refund)
-                await query.edit_message_text(
-                    f"❌ <b>Order #SMM-{oid} বাতিল করা হয়েছে এবং ৳{refund:.2f} ক্রেতার ওয়ালেটে রিফান্ড দেওয়া হয়েছে।</b>",
+        if action == "comp":
+            await credit_referral_on_completed_order(oid, context)
+            schedule_order_sheet_backup(oid)
+            await query.edit_message_text(
+                f"✅ <b>Order #SMM-{oid} (Panel #{order['panel_order_id']}) সফলভাবে Completed করা হয়েছে!</b>",
+                parse_mode="HTML",
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=order["buyer_id"],
+                    text=(
+                        f"🎉 <b>অর্ডার সম্পন্ন হয়েছে! (#SMM-{oid})</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🌐 Panel Order ID: <code>#{order['panel_order_id']}</code>\n"
+                        f"📦 সার্ভিস: {order['service_name']}\n"
+                        f"🔢 পরিমাণ: {order['quantity']}\n"
+                        "✨ স্ট্যাটাস: <b>✅ Completed</b>\n\n"
+                        "আমাদের সাথে থাকার জন্য ধন্যবাদ!"
+                    ),
                     parse_mode="HTML",
                 )
-                try:
-                    await context.bot.send_message(
-                        chat_id=order["buyer_id"],
-                        text=(
-                            f"❌ <b>অর্ডার বাতিল ও রিফান্ড (#SMM-{oid})</b>\n"
-                            "━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📦 সার্ভিস: {order['service_name']}\n"
-                            f"💰 রিফান্ড: <b>+৳{refund:.2f}</b> আপনার ওয়ালেটে ফেরত দেওয়া হয়েছে।\n"
-                            f"💳 বর্তমান ব্যালেন্স: <b>৳{new_bal:.2f}</b>"
-                        ),
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-                return
+            except Exception:
+                pass
+            return
+
+        if action == "canc":
+            with _db_lock, db() as conn:
+                conn.execute(
+                    "UPDATE orders SET status = 'Cancelled', refunded = 1 WHERE id = ?",
+                    (oid,),
+                )
+                conn.commit()
+            refund = float(order["sell_price"] or order["price"] or 0.0)
+            new_bal = add_balance(
+                order["buyer_id"], refund, reason=f"Order Cancelled Refund #SMM-{oid}"
+            )
+            schedule_order_sheet_backup(oid)
+            await query.edit_message_text(
+                f"❌ <b>Order #SMM-{oid} (Panel #{order['panel_order_id']}) বাতিল করা হয়েছে এবং ৳{refund:.2f} ক্রেতার ওয়ালেটে রিফান্ড দেওয়া হয়েছে।</b>",
+                parse_mode="HTML",
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=order["buyer_id"],
+                    text=(
+                        f"❌ <b>অর্ডার বাতিল ও রিফান্ড (#SMM-{oid})</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🌐 Panel Order ID: <code>#{order['panel_order_id']}</code>\n"
+                        f"📦 সার্ভিস: {order['service_name']}\n"
+                        f"💰 রিফান্ড: <b>+৳{refund:.2f}</b> আপনার ওয়ালেটে ফেরত দেওয়া হয়েছে।\n"
+                        f"💳 বর্তমান ব্যালেন্স: <b>৳{new_bal:.2f}</b>"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            return
 
 
 async def handle_delete_service_cb(
@@ -1229,6 +2741,46 @@ async def handle_delete_service_cb(
     await query.edit_message_text(f"🗑️ সার্ভিস #{sid} সফলভাবে ডিলিট করা হয়েছে।")
 
 
+async def handle_edit_service_cb(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    try:
+        sid = int((query.data or "").replace("edit_", "", 1))
+    except ValueError:
+        return
+    s = get_service(sid)
+    if not s:
+        await query.edit_message_text("⚠️ সার্ভিসটি পাওয়া যায়নি।")
+        return
+
+    context.user_data.clear()
+    context.user_data["edit_sid"] = sid
+    context.user_data["state"] = ST_EDIT_SMM_NAME
+    sell_rate = get_sell_rate_per_1k(s)
+    await query.edit_message_text(
+        f"✏️ <b>সার্ভিস এডিট: #{s['id']} {s['name']}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 বর্তমান নাম: <code>{s['name']}</code>\n"
+        f"🌐 বর্তমান Panel Service ID: <code>{s['panel_service_id']}</code>\n"
+        f"💵 বর্তমান Panel Rate/1000: <code>{_fmt_num(s['panel_rate'])}</code>\n"
+        f"💰 বর্তমান Sell Price/1000: <code>৳{_fmt_num(sell_rate)}</code>\n"
+        f"📉 Min: <code>{s['min_qty']}</code> | 📈 Max: <code>{s['max_qty']}</code>\n"
+        f"🔄 Refill: <code>{get_refill_label(s)}</code> | Active: <code>{s['is_active']}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📝 <b>ধাপ ১/৮:</b> সার্ভিসের নতুন নাম লিখুন (আগের নামই রাখতে <code>.</code> লিখুন):",
+        parse_mode="HTML",
+    )
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text="📝 সার্ভিসের নাম লিখুন অথবা আগের নাম রাখতে . (ডট) পাঠান (বাতিল করতে ❌ বাতিল করুন চাপুন):",
+        reply_markup=cancel_menu(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # User Menu Views (Orders, Profile, Refer, Leaderboard, Missions, Support)
 # ---------------------------------------------------------------------------
@@ -1236,7 +2788,7 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     uid = update.effective_user.id
     with _db_lock, db() as conn:
         rows = conn.execute(
-            "SELECT * FROM orders WHERE buyer_id = ? ORDER BY id DESC LIMIT 15",
+            "SELECT * FROM orders WHERE buyer_id = ? ORDER BY id DESC LIMIT 10",
             (uid,),
         ).fetchall()
     if not rows:
@@ -1253,21 +2805,37 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "processing": "⚙️ Processing",
         "completed": "✅ Completed",
         "approved": "✅ Completed",
+        "partial": "⚠️ Partial (Auto-Refunded Remains)",
         "cancelled": "❌ Cancelled (Refunded)",
         "rejected": "❌ Rejected",
     }
-    lines = ["📦 <b>আপনার সর্বশেষ ১৫টি অর্ডারের স্ট্যাটাস:</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
-    for r in rows:
-        st_badge = status_map.get(r["status"], r["status"])
-        lines.append(
-            f"🧾 <b>#SMM-{r['id']}</b> — {st_badge}\n"
-            f"├─ 📦 {r['service_name']}\n"
-            f"├─ 🔢 Qty: {r['quantity']} | 💰 ৳{r['price']:.2f}\n"
-            f"└─ 🔗 <code>{r['target_link']}</code>\n"
-        )
     await update.message.reply_text(
-        "\n".join(lines), parse_mode="HTML", reply_markup=main_menu(uid)
+        "📦 <b>আপনার সর্বশেষ অর্ডারসমূহ (লাইভ স্ট্যাটাস ও রিফিল প্যানেল):</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu(uid),
     )
+    for r in rows:
+        st_norm = str(r["status"] or "Pending").lower()
+        st_badge = status_map.get(st_norm, r["status"])
+        panel_oid = int(r["panel_order_id"] or 0)
+        svc = get_service(r["service_id"])
+        refill_label = f"🔄 {get_refill_label(svc)}" if svc else "🚫 No Refill"
+        p_line = f"🌐 <b>Panel Order ID:</b> <code>#{panel_oid}</code> | {refill_label}\n" if panel_oid > 0 else ""
+        rem_line = (
+            f"▶️ Start: {r['starts_count']} | 📉 Remains: {r['remains']}\n"
+            if panel_oid > 0
+            else ""
+        )
+        text = (
+            f"🧾 <b>#SMM-{r['id']}</b> — {st_badge}\n"
+            f"{p_line}"
+            f"📦 <b>সার্ভিস:</b> {r['service_name']}\n"
+            f"🔢 <b>পরিমাণ:</b> {r['quantity']} | 💰 <b>চার্জ:</b> ৳{r['price']:.2f}\n"
+            f"{rem_line}"
+            f"🔗 <code>{r['target_link']}</code>"
+        )
+        kb = build_user_order_keyboard(r, svc)
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1278,7 +2846,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "SELECT COUNT(*) FROM orders WHERE buyer_id = ?", (user.id,)
         ).fetchone()[0]
         comp_orders = conn.execute(
-            "SELECT COUNT(*) FROM orders WHERE buyer_id = ? AND status IN ('completed','approved')",
+            "SELECT COUNT(*) FROM orders WHERE buyer_id = ? AND LOWER(status) IN ('completed','approved')",
             (user.id,),
         ).fetchone()[0]
 
@@ -1295,9 +2863,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"└─ 🛒 <b>মোট খরচ:</b> ৳{u['total_spent']:.2f}\n\n"
         "📊 <b>অ্যাক্টিভিটি সামারি:</b>\n"
         f"├─ 📦 <b>মোট অর্ডার:</b> {total_orders} টি\n"
-        f"├─ ✅ <b>সম্পন্ন অর্ডার:</b> {comp_orders} টি\n"
-        f"├─ 👥 <b>মোট রেফারেল:</b> {u['refer_count']} জন\n"
-        f"└─ 🎁 <b>রেফারেল আয়:</b> ৳{u['refer_earned']:.2f}\n"
+        f"└─ ✅ <b>সম্পন্ন অর্ডার:</b> {comp_orders} টি\n"
         "━━━━━━━━━━━━━━━━━━━━━━"
     )
     await update.message.reply_text(
@@ -1306,22 +2872,25 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def show_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Shows the referral rule ONLY in the Refer menu:
+    Refer bonus = 10% of the referred user's COMPLETED order amount only, never on join.
+    """
     user = update.effective_user
     u = ensure_user(user.id, user.username or "", user.first_name or "User")
     bot_info = await context.bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start=ref_{user.id}"
-    bonus = get_setting("refer_bonus", "2")
     text = (
         "👥 <b>রেফার করুন এবং আনলিমিটেড আয় করুন!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎁 প্রতি সফল রেফারে পাবেন: <b>৳{bonus} টাকা বোনাস!</b>\n\n"
+        "🎁 <b>রেফার বোনাস নিয়ম:</b>\n"
+        "আপনার রেফার করা ইউজারের <b>COMPLETED</b> অর্ডার অ্যামাউন্টের <b>10%</b> বোনাস পাবেন (শুধুমাত্র জয়েন করলে কোনো বোনাস নেই — অর্ডার সম্পন্ন হলেই ১০% কমিশন আপনার ওয়ালেটে যোগ হবে)।\n\n"
         "🔗 <b>আপনার পার্সোনাল রেফারেল লিংক:</b>\n"
         f"<code>{ref_link}</code>\n\n"
         "📊 <b>আপনার রেফারেল স্ট্যাটাস:</b>\n"
         f"├─ 👥 <b>মোট রেফার:</b> {u['refer_count']} জন\n"
-        f"└─ 💰 <b>মোট বোনাস আয়:</b> ৳{u['refer_earned']:.2f} টাকা\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 আপনার বন্ধুদের লিংকটি শেয়ার করুন। তারা লিংকে ক্লিক করে Start করলেই আপনার ব্যালেন্সে অটোমেটিক টাকা যোগ হয়ে যাবে!"
+        f"└─ 💰 <b>মোট রেফারেল বোনাস আয়:</b> ৳{u['refer_earned']:.2f} টাকা\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
     )
     await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=main_menu(user.id)
@@ -1332,9 +2901,6 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     with _db_lock, db() as conn:
         top_buyers = conn.execute(
             "SELECT first_name, user_id, total_spent FROM users ORDER BY total_spent DESC, balance DESC LIMIT 5"
-        ).fetchall()
-        top_refs = conn.execute(
-            "SELECT first_name, user_id, refer_count FROM users ORDER BY refer_count DESC LIMIT 5"
         ).fetchall()
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
@@ -1347,14 +2913,9 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         name = r["first_name"] or f"User {str(r['user_id'])[:4]}**"
         lines.append(f"{medals[idx]} <b>{name}</b> — ৳{r['total_spent']:.0f}")
 
-    lines.append("\n👥 <b>টপ রেফারার (Top Referrers):</b>")
-    for idx, r in enumerate(top_refs):
-        name = r["first_name"] or f"User {str(r['user_id'])[:4]}**"
-        lines.append(f"{medals[idx]} <b>{name}</b> — {r['refer_count']} রেফার")
-
     lines.append(
         "\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔥 বেশি অর্ডার ও রেফার করে আপনিও চলে আসুন ভিআইপি লিডারবোর্ডের শীর্ষে!"
+        "🔥 বেশি অর্ডার করে আপনিও চলে আসুন ভিআইপি লিডারবোর্ডের শীর্ষে!"
     )
     await update.message.reply_text(
         "\n".join(lines),
@@ -1420,6 +2981,12 @@ async def handle_claim_daily_cb(update: Update, context: ContextTypes.DEFAULT_TY
         )
         conn.commit()
     new_bal = get_balance(user.id)
+    schedule_sheet_backup(
+        user_id=user.id,
+        username=user.username or user.first_name or "",
+        balance=new_bal,
+        order_details=f"Daily Bonus Claimed (+৳{daily_amt:.2f})",
+    )
     await query.edit_message_text(
         f"🎉 <b>অভিনন্দন! আপনি ৳{daily_amt:.2f} ডেইলি বোনাস পেয়েছেন!</b>\n"
         f"💳 আপনার বর্তমান ব্যালেন্স: <b>৳{new_bal:.2f}</b>",
@@ -1442,22 +3009,35 @@ async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------------------
-# Secret Admin Panel Views & Flows
+# 5. Secret Admin Panel Views & Flows (including "All Users" Sheet & CSV Export)
 # ---------------------------------------------------------------------------
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
     context.user_data.clear()
     with _db_lock, db() as conn:
         u_cnt = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         p_ord = conn.execute(
-            "SELECT COUNT(*) FROM orders WHERE status IN ('pending','processing')"
+            "SELECT COUNT(*) FROM orders WHERE LOWER(status) IN ('pending','processing')"
         ).fetchone()[0]
         p_dep = conn.execute(
             "SELECT COUNT(*) FROM balance_requests WHERE status = 'pending'"
         ).fetchone()[0]
 
+    pbal_res = panel_balance()
+    if pbal_res.get("ok"):
+        pbal_line = f"🌐 <b>SMM Panel Balance:</b> <b>{pbal_res['balance']} {pbal_res['currency']}</b>"
+    else:
+        pbal_line = f"🌐 <b>SMM Panel Balance:</b> ⚠️ <code>{pbal_res.get('error')}</code>"
+
+    sheet_id, creds_raw = _get_google_sheets_config()
+    gs_status = "✅ Active" if (sheet_id and creds_raw) else "⚠️ Not Configured (Skipped)"
+
     text = (
         "📊 <b>VIP SMM ADMIN CONTROL PANEL</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{pbal_line}\n"
+        f"📑 <b>Google Sheets Backup:</b> {gs_status}\n"
         f"👥 <b>মোট ইউজার:</b> {u_cnt} জন\n"
         f"📦 <b>পেন্ডিং/প্রসেসিং অর্ডার:</b> {p_ord} টি\n"
         f"💳 <b>পেন্ডিং ডিপোজিট:</b> {p_dep} টি\n\n"
@@ -1469,10 +3049,116 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=admin_menu())
 
 
+def _fetch_all_users_with_orders() -> list[sqlite3.Row]:
+    """Fetches all users with user ID, username, name, wallet balance, total orders, and join date."""
+    with _db_lock, db() as conn:
+        return conn.execute(
+            """
+            SELECT u.user_id,
+                   u.username,
+                   u.first_name,
+                   u.balance,
+                   u.joined_at,
+                   COUNT(o.id) AS total_orders
+            FROM users u
+            LEFT JOIN orders o ON o.buyer_id = u.user_id
+            GROUP BY u.user_id
+            ORDER BY u.joined_at DESC, u.user_id ASC
+            """
+        ).fetchall()
+
+
+async def send_all_users_csv(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Exports all users to a CSV file and sends it directly to the Admin in Telegram."""
+    rows = _fetch_all_users_with_orders()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        ["User ID", "Username", "Name", "Wallet Balance", "Total Orders", "Join Date"]
+    )
+    for r in rows:
+        uname = f"@{r['username']}" if r["username"] else "-"
+        writer.writerow(
+            [
+                r["user_id"],
+                uname,
+                r["first_name"] or "User",
+                f"{float(r['balance'] or 0.0):.2f}",
+                int(r["total_orders"] or 0),
+                r["joined_at"] or "-",
+            ]
+        )
+    csv_bytes = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+    csv_bytes.name = f"all_users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=csv_bytes,
+        caption=f"📥 <b>All Users Sheet Export ({len(rows)} Users)</b>\nColumns: User ID, Username, Name, Wallet Balance, Total Orders, Join Date",
+        parse_mode="HTML",
+    )
+
+
+async def admin_show_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Admin 'All Users' sheet view: lists ALL users in one place with
+    user ID, username, name, wallet balance, total orders, join date, plus 1-click CSV export.
+    """
+    rows = _fetch_all_users_with_orders()
+    if not rows:
+        await update.message.reply_text(
+            "👥 এখনো কোনো ইউজার রেজিস্টার করেনি।", reply_markup=admin_menu()
+        )
+        return
+
+    header = (
+        f"👥 <b>ALL USERS SHEET (মোট ইউজার: {len(rows)} জন)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>User ID | Username | Name | Balance | Orders | Join Date</i>\n\n"
+    )
+    export_kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📥 Export All Users (CSV Sheet)",
+                    callback_data="adm_export_users",
+                )
+            ]
+        ]
+    )
+
+    chunks = []
+    current = header
+    for idx, r in enumerate(rows, start=1):
+        uname = f"@{r['username']}" if r["username"] else "—"
+        name = (r["first_name"] or "User").replace("<", "").replace(">", "")
+        bal = float(r["balance"] or 0.0)
+        tot_ord = int(r["total_orders"] or 0)
+        jdate = str(r["joined_at"] or "—")[:16]
+        line = (
+            f"{idx}. <code>{r['user_id']}</code> | {uname} | <b>{name}</b>\n"
+            f"   💳 <b>৳{bal:.2f}</b> | 📦 Orders: <b>{tot_ord}</b> | 📅 {jdate}\n"
+        )
+        if len(current) + len(line) > 3800:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+
+    for i, chunk_text in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+        await update.message.reply_text(
+            chunk_text,
+            parse_mode="HTML",
+            reply_markup=export_kb if is_last else None,
+        )
+
+
 async def admin_show_pending_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with _db_lock, db() as conn:
         rows = conn.execute(
-            "SELECT * FROM orders WHERE status IN ('pending','processing') ORDER BY id ASC LIMIT 15"
+            "SELECT * FROM orders WHERE LOWER(status) IN ('pending','processing') ORDER BY id ASC LIMIT 15"
         ).fetchall()
     if not rows:
         await update.message.reply_text(
@@ -1480,25 +3166,20 @@ async def admin_show_pending_orders(update: Update, context: ContextTypes.DEFAUL
         )
         return
     for r in rows:
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("⚙️ Processing", callback_data=f"ord_proc_{r['id']}"),
-                    InlineKeyboardButton("✅ Completed", callback_data=f"ord_comp_{r['id']}"),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ Cancel & Refund", callback_data=f"ord_canc_{r['id']}"
-                    )
-                ],
-            ]
-        )
+        panel_oid = int(r["panel_order_id"] or 0)
+        panel_sid = int(r["panel_service_id"] or 0)
+        p_cost = float(r["panel_cost"] or 0.0)
+        s_price = float(r["sell_price"] or r["price"] or 0.0)
+        profit = round(s_price - p_cost, 2) if p_cost > 0 else s_price
+        kb = _build_admin_order_kb(r["id"], panel_oid)
         await update.message.reply_text(
-            f"🧾 <b>Order #SMM-{r['id']}</b> [{r['status'].upper()}]\n"
-            f"📦 সার্ভিস: {r['service_name']}\n"
-            f"🔗 লিংক: <code>{r['target_link']}</code>\n"
-            f"🔢 পরিমাণ: {r['quantity']} | 💰 দাম: ৳{r['price']:.2f}\n"
-            f"👤 ক্রেতা: {r['buyer_name']} (<code>{r['buyer_id']}</code>)",
+            f"🧾 <b>Order #SMM-{r['id']}</b> [{str(r['status']).upper()}]\n"
+            f"🌐 <b>Panel Order ID:</b> <code>#{panel_oid}</code> (Panel Service #{panel_sid})\n"
+            f"📦 <b>সার্ভিস:</b> {r['service_name']}\n"
+            f"🔗 <b>লিংক:</b> <code>{r['target_link']}</code>\n"
+            f"🔢 <b>পরিমাণ:</b> {r['quantity']}\n"
+            f"💰 <b>Sell Price:</b> ৳{s_price:.2f} | <b>Panel Cost:</b> {p_cost:.4f} | <b>Profit:</b> ৳{profit:.2f}\n"
+            f"👤 <b>ক্রেতা:</b> {r['buyer_name']} (<code>{r['buyer_id']}</code>)",
             parse_mode="HTML",
             reply_markup=kb,
         )
@@ -1546,23 +3227,71 @@ async def admin_show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         tot_spn = conn.execute("SELECT COALESCE(SUM(total_spent),0) FROM users").fetchone()[0]
         o_tot = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
         o_comp = conn.execute(
-            "SELECT COUNT(*) FROM orders WHERE status IN ('completed','approved')"
+            "SELECT COUNT(*) FROM orders WHERE LOWER(status) IN ('completed','approved')"
         ).fetchone()[0]
-        s_cnt = conn.execute("SELECT COUNT(*) FROM services").fetchone()[0]
+        s_cnt = conn.execute("SELECT COUNT(*) FROM services WHERE is_active = 1").fetchone()[0]
+        tot_pcost = conn.execute(
+            "SELECT COALESCE(SUM(panel_cost),0) FROM orders WHERE LOWER(status) NOT IN ('cancelled','rejected')"
+        ).fetchone()[0]
+        tot_sprice = conn.execute(
+            "SELECT COALESCE(SUM(sell_price),0) FROM orders WHERE LOWER(status) NOT IN ('cancelled','rejected')"
+        ).fetchone()[0]
 
+    pbal_res = panel_balance()
+    if pbal_res.get("ok"):
+        pbal_line = f"{pbal_res['balance']} {pbal_res['currency']}"
+    else:
+        pbal_line = f"⚠️ {pbal_res.get('error')}"
+
+    est_profit = round(float(tot_sprice) - float(tot_pcost), 2)
     text = (
         "📈 <b>বট লাইভ অ্যানালিটিক্স ও রিপোর্ট</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 <b>SMM Panel Balance:</b> <b>{pbal_line}</b>\n"
         f"👥 <b>মোট রেজিস্টার্ড ইউজার:</b> {u_cnt} জন\n"
         f"📋 <b>মোট অ্যাক্টিভ সার্ভিস:</b> {s_cnt} টি\n"
         f"📦 <b>মোট অর্ডার:</b> {o_tot} টি (সম্পন্ন: {o_comp} টি)\n\n"
-        "💰 <b>ফাইন্যান্সিয়াল রিপোর্ট:</b>\n"
+        "💰 <b>ফাইন্যান্সিয়াল ও প্রফিট রিপোর্ট:</b>\n"
         f"├─ 🏦 <b>মোট ডিপোজিট কালেকশন:</b> ৳{tot_dep:.2f}\n"
         f"├─ 🛒 <b>মোট সার্ভিস সেল:</b> ৳{tot_spn:.2f}\n"
+        f"├─ 🌐 <b>মোট প্যানেল খরচ (Panel Cost):</b> {tot_pcost:.2f}\n"
+        f"├─ 💹 <b>আনুমানিক প্রফিট:</b> ৳{est_profit:.2f}\n"
         f"└─ 💳 <b>ইউজার ওয়ালেটে জমা আছে:</b> ৳{tot_bal:.2f}\n"
         "━━━━━━━━━━━━━━━━━━━━━━"
     )
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=admin_menu())
+
+
+def _parse_refill_input(raw_text: str) -> tuple[int, str]:
+    """
+    Parses Admin refill input:
+      - '0' or 'no' or 'no refill' -> (0, 'No Refill')
+      - '1' or 'yes' -> (1, 'Refill')
+      - Custom refill string like 'LifeTime refill', 'REFILL 365D', 'REFILL 30D' -> (1, raw_text)
+    """
+    val = (raw_text or "").strip()
+    low = val.lower()
+    if low in ("0", "no", "no refill", "none", "false"):
+        return (0, "No Refill")
+    if low in ("1", "yes", "true", "refill"):
+        return (1, "Refill")
+    return (1, val)
+
+
+def _parse_max_input(raw_text: str) -> int:
+    """
+    Parses Admin Max input:
+      - 'unlimited' or '-1' -> -1 (Unlimited)
+      - '0' -> 0 (Not set / Editable in Admin)
+      - positive integer -> int
+    """
+    val = (raw_text or "").strip().lower()
+    if val in ("unlimited", "unl", "inf", "-1"):
+        return -1
+    n = int(val)
+    if n < 0:
+        raise ValueError
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -1578,105 +3307,130 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
 
     if text in (BTN_CANCEL, BTN_BACK):
         context.user_data.clear()
-        markup = admin_menu() if is_admin(user.id) and state.startswith(("add_", "bal_", "set_", "broadcast")) else main_menu(user.id)
+        markup = (
+            admin_menu()
+            if is_admin(user.id)
+            and state.startswith(("add_", "edit_", "bal_", "set_", "broadcast"))
+            else main_menu(user.id)
+        )
         await update.message.reply_text("❌ বাতিল করা হয়েছে।", reply_markup=markup)
         return True
 
-    # 1. User SMM Order Link -> Ask Quantity
+    # Step 2: User sends link -> validate link (http/https + platform domain check)
     if state == ST_ORDER_LINK:
         sid = context.user_data.get("order_service_id")
         s = get_service(sid) if sid else None
-        if not s:
+        if not s or int(s["panel_service_id"] or 0) <= 0:
             context.user_data.clear()
-            await update.message.reply_text("⚠️ সার্ভিস পাওয়া যায়নি।", reply_markup=main_menu(user.id))
+            await update.message.reply_text(
+                "⚠️ সার্ভিসটি বর্তমানে অর্ডারের জন্য উপলব্ধ নয়।",
+                reply_markup=main_menu(user.id),
+            )
             return True
+
+        valid, err_msg = validate_service_link(s["category"], s["name"], text)
+        if not valid:
+            await update.message.reply_text(
+                err_msg,
+                parse_mode="HTML",
+                reply_markup=cancel_menu(),
+            )
+            return True
+
+        sell_rate = get_sell_rate_per_1k(s)
+        mm_txt = format_min_max(s, admin_view=False)
         context.user_data["order_link"] = text
         context.user_data["state"] = ST_ORDER_QTY
         await update.message.reply_text(
-            f"✅ লিংক সেভ হয়েছে: <code>{text}</code>\n\n"
-            f"🔢 <b>ধাপ ২/২:</b> আপনি কত <b>পরিমাণ (Quantity)</b> নিতে চান?\n"
-            f"📉 সর্বনিম্ন: <b>{s['min_qty']}</b> | 📈 সর্বোচ্চ: <b>{s['max_qty']}</b>\n"
-            f"💰 রেট: <b>৳{s['rate_per_1k']:.2f} / ১০০০</b>\n\n"
+            f"✅ লিংক যাচাই সম্পন্ন: <code>{text}</code>\n\n"
+            f"🔢 <b>ধাপ ২/৩:</b> আপনি কত <b>পরিমাণ (Quantity)</b> নিতে চান?\n"
+            f"📊 লিমিট: <b>{mm_txt}</b>\n"
+            f"💰 মূল্য: <b>৳{_fmt_num(sell_rate)} / 1000</b>\n"
+            f"⏱️ Average time: <b>{get_avg_time_label(s)}</b>\n\n"
             "শুধু সংখ্যায় লিখুন (যেমন: <code>1000</code>):",
             parse_mode="HTML",
             reply_markup=cancel_menu(),
         )
         return True
 
-    # 2. User SMM Order Quantity -> Calculate Price, Deduct Balance & Place Order
+    # Step 3 & Step 4: User sends quantity -> validate Min/Max -> show price & Confirm/Cancel
     if state == ST_ORDER_QTY:
         sid = context.user_data.get("order_service_id")
         s = get_service(sid) if sid else None
-        if not s:
+        if not s or int(s["panel_service_id"] or 0) <= 0:
             context.user_data.clear()
-            return True
-        try:
-            qty = int(text)
-        except ValueError:
             await update.message.reply_text(
-                "⚠️ শুধুমাত্র সংখ্যায় পরিমাণ লিখুন (যেমন: 1000):",
-                reply_markup=cancel_menu(),
-            )
-            return True
-
-        if qty < int(s["min_qty"]) or qty > int(s["max_qty"]):
-            await update.message.reply_text(
-                f"⚠️ পরিমাণ অবশ্যই <b>{s['min_qty']}</b> থেকে <b>{s['max_qty']}</b> এর মধ্যে হতে হবে!",
-                parse_mode="HTML",
-                reply_markup=cancel_menu(),
-            )
-            return True
-
-        cost = max(1.0, round((qty / 1000.0) * float(s["rate_per_1k"]), 2))
-        bal = get_balance(user.id)
-        link = context.user_data.get("order_link", "")
-        context.user_data.clear()
-
-        if bal < cost:
-            needed = round(cost - bal, 2)
-            await update.message.reply_text(
-                "⚠️ <b>আপনার ওয়ালেটে পর্যাপ্ত ব্যালেন্স নেই!</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📦 সার্ভিস: {s['name']}\n"
-                f"🔢 পরিমাণ: {qty}\n"
-                f"💰 মোট খরচ: <b>৳{cost:.2f}</b>\n"
-                f"💳 আপনার ব্যালেন্স: <b>৳{bal:.2f}</b>\n"
-                f"❗ আরও প্রয়োজন: <b>৳{needed:.2f}</b>\n\n"
-                "দয়া করে <b>💰 ডিপোজিট</b> বাটনে চাপ দিয়ে ব্যালেন্স অ্যাড করুন।",
-                parse_mode="HTML",
+                "⚠️ সার্ভিস পাওয়া যায়নি। কোনো টাকা কাটা হয়নি।",
                 reply_markup=main_menu(user.id),
             )
             return True
 
-        new_bal = add_balance(user.id, -cost)
-        record_spend(user.id, cost)
-        with _db_lock, db() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO orders
-                (service_id, service_name, buyer_id, buyer_name, target_link, quantity, price, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-                """,
-                (s["id"], s["name"], user.id, user.first_name or "User", link, qty, cost),
+        try:
+            qty = int(text)
+            if qty <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ শুধুমাত্র পূর্ণসংখ্যায় পরিমাণ লিখুন (যেমন: 1000)। কোনো টাকা কাটা হয়নি:",
+                reply_markup=cancel_menu(),
             )
-            order_id = cur.lastrowid
-            conn.commit()
+            return True
 
-        await update.message.reply_text(
-            "🎉 <b>আপনার অর্ডার সফলভাবে কনফার্ম হয়েছে!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🧾 <b>Order ID:</b> <code>#SMM-{order_id}</code>\n"
-            f"📦 <b>সার্ভিস:</b> {s['name']}\n"
-            f"🔗 <b>লিংক:</b> <code>{link}</code>\n"
-            f"🔢 <b>পরিমাণ:</b> {qty}\n"
-            f"💰 <b>মোট চার্জ:</b> ৳{cost:.2f}\n"
-            f"💳 <b>নতুন ব্যালেন্স:</b> ৳{new_bal:.2f}\n"
-            "⏳ <b>স্ট্যাটাস:</b> Pending (খুব দ্রুত কাজ শুরু হবে)\n"
-            "━━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode="HTML",
-            reply_markup=main_menu(user.id),
+        min_q = int(s["min_qty"] or 0)
+        max_q = int(s["max_qty"] or 0)
+        if min_q > 0 and qty < min_q:
+            await update.message.reply_text(
+                f"⚠️ সর্বনিম্ন অর্ডার পরিমাণ (Min): <b>{min_q}</b>!\n"
+                "আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি। সঠিক সংখ্যা লিখুন:",
+                parse_mode="HTML",
+                reply_markup=cancel_menu(),
+            )
+            return True
+        if max_q > 0 and qty > max_q:
+            await update.message.reply_text(
+                f"⚠️ সর্বোচ্চ অর্ডার পরিমাণ (Max): <b>{max_q}</b>!\n"
+                "আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি। সঠিক সংখ্যা লিখুন:",
+                parse_mode="HTML",
+                reply_markup=cancel_menu(),
+            )
+            return True
+
+        sell_rate = get_sell_rate_per_1k(s)
+        sell_price = calc_sell_price(s, qty)
+        link = context.user_data.get("order_link", "")
+        context.user_data["order_qty"] = qty
+        context.user_data["state"] = ST_ORDER_CONFIRM
+
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"✅ Confirm Order (৳{sell_price:.2f})",
+                        callback_data="order_confirm_cb",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ Cancel", callback_data="order_cancel_cb"
+                    )
+                ],
+            ]
         )
-        await notify_admin_new_order(context, order_id, s["name"], user, link, qty, cost)
+        await update.message.reply_text(
+            "🧾 <b>ধাপ ৩/৩: অর্ডার কনফার্মেশন</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 <b>সার্ভিস:</b> {s['name']} (Panel ID #{s['panel_service_id']})\n"
+            f"🔗 <b>লিংক:</b> <code>{link}</code>\n"
+            f"🔢 <b>পরিমাণ (Quantity):</b> {qty}\n"
+            f"🔄 <b>রিফিল:</b> {get_refill_label(s)}\n"
+            f"⏱️ <b>Average time:</b> {get_avg_time_label(s)}\n"
+            f"💰 <b>মূল্য (প্রতি ১০০০):</b> ৳{_fmt_num(sell_rate)}\n"
+            f"💳 <b>মোট মূল্য (Price):</b> <b>৳{sell_price:.2f}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "👇 অর্ডারটি প্যানেলে পাঠাতে <b>Confirm Order</b> বাটনে চাপুন:",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
         return True
 
     # 3. Deposit Amount -> Ask TrxID
@@ -1793,11 +3547,12 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data.clear()
         return False
 
+    # Admin Add SMM Service (service name, panel_service_id, panel rate, sell price, Min, Max, refill)
     if state == ST_ADD_SMM_CAT:
         context.user_data["smm_cat"] = text
         context.user_data["state"] = ST_ADD_SMM_NAME
         await update.message.reply_text(
-            "📝 সার্ভিসের নাম লিখুন (যেমন: <code>TikTok Real Followers [VIP]</code>):",
+            "📝 <b>সার্ভিসের নাম (Service Name)</b> লিখুন (যেমন: <code>Instagram Followers</code>):",
             parse_mode="HTML",
             reply_markup=cancel_menu(),
         )
@@ -1805,9 +3560,48 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
 
     if state == ST_ADD_SMM_NAME:
         context.user_data["smm_name"] = text
+        context.user_data["state"] = ST_ADD_SMM_PID
+        await update.message.reply_text(
+            "🌐 প্যানেলের <b>panel_service_id</b> লিখুন (যেমন: <code>11432</code>):",
+            parse_mode="HTML",
+            reply_markup=cancel_menu(),
+        )
+        return True
+
+    if state == ST_ADD_SMM_PID:
+        try:
+            pid = int(text)
+            if pid <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "সঠিক পূর্ণসংখ্যা panel_service_id লিখুন (যেমন: 11432):",
+                reply_markup=cancel_menu(),
+            )
+            return True
+        context.user_data["smm_pid"] = pid
+        context.user_data["state"] = ST_ADD_SMM_PRATE
+        await update.message.reply_text(
+            "💵 প্যানেলে প্রতি ১০০০ এর রেট (<b>Panel Rate per 1000</b>) কত? (যেমন: <code>486.72</code>):",
+            parse_mode="HTML",
+            reply_markup=cancel_menu(),
+        )
+        return True
+
+    if state == ST_ADD_SMM_PRATE:
+        try:
+            prate = float(text)
+            if prate < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "সঠিক সংখ্যা লিখুন (যেমন: 486.72):", reply_markup=cancel_menu()
+            )
+            return True
+        context.user_data["smm_prate"] = prate
         context.user_data["state"] = ST_ADD_SMM_RATE
         await update.message.reply_text(
-            "💰 প্রতি ১০০০ (1K) এর রেট কত টাকা? (শুধু সংখ্যা, যেমন: <code>90</code>):",
+            "💰 কাস্টমারের জন্য প্রতি ১০০০ এর বিক্রয় মূল্য (<b>Sell Price per 1000</b>) কত টাকা? (যেমন: <code>600</code>):",
             parse_mode="HTML",
             reply_markup=cancel_menu(),
         )
@@ -1819,12 +3613,12 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
             if rate <= 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("সঠিক সংখ্যা লিখুন (যেমন: 90):", reply_markup=cancel_menu())
+            await update.message.reply_text("সঠিক সংখ্যা লিখুন (যেমন: 600):", reply_markup=cancel_menu())
             return True
         context.user_data["smm_rate"] = rate
         context.user_data["state"] = ST_ADD_SMM_MIN
         await update.message.reply_text(
-            "📉 সর্বনিম্ন অর্ডার সংখ্যা (Min Quantity) কত? (যেমন: <code>100</code>):",
+            "📉 সর্বনিম্ন অর্ডার সংখ্যা (<b>Min Quantity</b>) কত? (যেমন: <code>100</code>, অথবা নির্ধারণ না করতে <code>0</code> দিন):",
             parse_mode="HTML",
             reply_markup=cancel_menu(),
         )
@@ -1833,15 +3627,15 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
     if state == ST_ADD_SMM_MIN:
         try:
             mn = int(text)
-            if mn <= 0:
+            if mn < 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("সঠিক সংখ্যা লিখুন (যেমন: 100):", reply_markup=cancel_menu())
+            await update.message.reply_text("সঠিক পূর্ণসংখ্যা লিখুন (যেমন: 100 বা 0):", reply_markup=cancel_menu())
             return True
         context.user_data["smm_min"] = mn
         context.user_data["state"] = ST_ADD_SMM_MAX
         await update.message.reply_text(
-            "📈 সর্বোচ্চ অর্ডার সংখ্যা (Max Quantity) কত? (যেমন: <code>100000</code>):",
+            "📈 সর্বোচ্চ অর্ডার সংখ্যা (<b>Max Quantity</b>) কত? (যেমন: <code>500000</code>, আনলিমিটেড হলে <code>unlimited</code>, বা <code>0</code>):",
             parse_mode="HTML",
             reply_markup=cancel_menu(),
         )
@@ -1849,98 +3643,251 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
 
     if state == ST_ADD_SMM_MAX:
         try:
-            mx = int(text)
-            if mx <= 0:
-                raise ValueError
+            mx = _parse_max_input(text)
         except ValueError:
-            await update.message.reply_text("সঠিক সংখ্যা লিখুন (যেমন: 100000):", reply_markup=cancel_menu())
+            await update.message.reply_text(
+                "সঠিক সংখ্যা অথবা unlimited লিখুন (যেমন: 500000 বা unlimited):",
+                reply_markup=cancel_menu(),
+            )
             return True
         context.user_data["smm_max"] = mx
+        context.user_data["state"] = ST_ADD_SMM_REFILL
+        await update.message.reply_text(
+            "🔄 এই সার্ভিসের <b>Refill</b> তথ্য লিখুন (যেমন: <code>LifeTime refill</code>, <code>REFILL 365D</code>, <code>REFILL 30D</code>, অথবা না থাকলে <code>No Refill</code> / <code>0</code>):",
+            parse_mode="HTML",
+            reply_markup=cancel_menu(),
+        )
+        return True
+
+    if state == ST_ADD_SMM_REFILL:
+        ref_en, ref_label = _parse_refill_input(text)
+        context.user_data["smm_refill"] = ref_en
+        context.user_data["smm_refill_type"] = ref_label
         context.user_data["state"] = ST_ADD_SMM_DESC
         await update.message.reply_text(
-            "📝 সার্ভিসের সংক্ষিপ্ত বিবরণ লিখুন (গ্যারান্টি/স্পিড ইত্যাদি):",
+            "📝 সার্ভিসের সংক্ষিপ্ত বিবরণ লিখুন (অথবা ডিফল্ট বিবরণ রাখতে <code>.</code> লিখুন):",
+            parse_mode="HTML",
             reply_markup=cancel_menu(),
         )
         return True
 
     if state == ST_ADD_SMM_DESC:
-        cat = context.user_data.get("smm_cat", "🌟 VIP SMM")
+        cat = context.user_data.get("smm_cat", "📸 Instagram")
         name = context.user_data.get("smm_name", "SMM Service")
-        rate = float(context.user_data.get("smm_rate", 100))
-        mn = int(context.user_data.get("smm_min", 100))
-        mx = int(context.user_data.get("smm_max", 100000))
+        pid = int(context.user_data.get("smm_pid", 0))
+        prate = float(context.user_data.get("smm_prate", 0.0))
+        rate = float(context.user_data.get("smm_rate", 100.0))
+        mn = int(context.user_data.get("smm_min", 0))
+        mx = int(context.user_data.get("smm_max", 0))
+        refill_en = int(context.user_data.get("smm_refill", 0))
+        refill_type = str(context.user_data.get("smm_refill_type", "No Refill"))
+        mk = round(rate - prate, 4) if prate > 0 else 0.0
+        desc = (
+            f"⏱️ Average time: 2-6 hours | 🔄 {refill_type}"
+            if text.strip() == "."
+            else text.strip()
+        )
         context.user_data.clear()
         with _db_lock, db() as conn:
             conn.execute(
                 """
                 INSERT INTO services
-                (category, name, service_type, rate_per_1k, min_qty, max_qty, description, file_id)
-                VALUES (?, ?, 'smm', ?, ?, ?, ?, NULL)
+                (category, name, service_type, rate_per_1k, min_qty, max_qty, description,
+                 file_id, panel_service_id, refill_enabled, refill_type, avg_time,
+                 panel_rate, markup, is_active)
+                VALUES (?, ?, 'smm', ?, ?, ?, ?, NULL, ?, ?, ?, '2-6 hours', ?, ?, 1)
                 """,
-                (cat, name, rate, mn, mx, text),
+                (cat, name, rate, mn, mx, desc, pid, refill_en, refill_type, prate, mk),
             )
             conn.commit()
         await update.message.reply_text(
             f"✅ <b>নতুন SMM সার্ভিস অ্যাড হয়েছে!</b>\n"
             f"💠 ক্যাটাগরি: {cat}\n"
             f"📦 নাম: {name}\n"
-            f"💰 রেট: ৳{rate:.2f}/1K ({mn} - {mx})",
+            f"🌐 Panel Service ID: <code>#{pid}</code> | 🔄 Refill: <code>{refill_type}</code>\n"
+            f"💵 Panel Rate: {_fmt_num(prate)}/1000 | 💰 Sell Price: ৳{_fmt_num(rate)}/1000\n"
+            f"📉 Min: {mn if mn > 0 else 'Editable'} | 📈 Max: {'Unlimited' if mx == -1 else (mx if mx > 0 else 'Editable')}",
             parse_mode="HTML",
             reply_markup=admin_menu(),
         )
         return True
 
-    # Add File Product Flow
-    if state == ST_ADD_FILE_NAME:
-        context.user_data["f_name"] = text
-        context.user_data["state"] = ST_ADD_FILE_PRICE
+    # Admin Edit SMM Service States
+    if state == ST_EDIT_SMM_NAME:
+        sid = int(context.user_data.get("edit_sid", 0))
+        s = get_service(sid)
+        context.user_data["edit_name"] = (
+            s["name"] if (text == "." and s) else text
+        )
+        context.user_data["state"] = ST_EDIT_SMM_PID
         await update.message.reply_text(
-            "💰 ফাইল প্রোডাক্টের ফিক্সড দাম কত টাকা? (যেমন: <code>150</code>):",
+            f"🌐 <b>ধাপ ২/৮:</b> প্যানেলের <b>panel_service_id</b> লিখুন (বর্তমান: <code>{s['panel_service_id'] if s else 0}</code>, অপরিবর্তিত রাখতে <code>.</code> দিন):",
             parse_mode="HTML",
             reply_markup=cancel_menu(),
         )
         return True
 
-    if state == ST_ADD_FILE_PRICE:
-        try:
-            pr = float(text)
-            if pr <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("সঠিক দাম লিখুন (যেমন: 150):", reply_markup=cancel_menu())
+    if state == ST_EDIT_SMM_PID:
+        sid = int(context.user_data.get("edit_sid", 0))
+        s = get_service(sid)
+        if text == "." and s:
+            pid = int(s["panel_service_id"])
+        else:
+            try:
+                pid = int(text)
+                if pid <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("সঠিক পূর্ণসংখ্যা panel_service_id লিখুন:", reply_markup=cancel_menu())
+                return True
+        context.user_data["edit_pid"] = pid
+        context.user_data["state"] = ST_EDIT_SMM_PRATE
+        await update.message.reply_text(
+            f"💵 <b>ধাপ ৩/৮:</b> প্যানেলের রেট (<b>Panel Rate per 1000</b>) লিখুন (বর্তমান: <code>{_fmt_num(s['panel_rate']) if s else 0}</code>, অপরিবর্তিত রাখতে <code>.</code> দিন):",
+            parse_mode="HTML",
+            reply_markup=cancel_menu(),
+        )
+        return True
+
+    if state == ST_EDIT_SMM_PRATE:
+        sid = int(context.user_data.get("edit_sid", 0))
+        s = get_service(sid)
+        if text == "." and s:
+            prate = float(s["panel_rate"])
+        else:
+            try:
+                prate = float(text)
+                if prate < 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("সঠিক সংখ্যা লিখুন:", reply_markup=cancel_menu())
+                return True
+        context.user_data["edit_prate"] = prate
+        context.user_data["state"] = ST_EDIT_SMM_RATE
+        await update.message.reply_text(
+            f"💰 <b>ধাপ ৪/৮:</b> কাস্টমারের বিক্রয় মূল্য (<b>Sell Price per 1000</b>) লিখুন (বর্তমান: <code>{_fmt_num(get_sell_rate_per_1k(s)) if s else 100}</code>, অপরিবর্তিত রাখতে <code>.</code> দিন):",
+            parse_mode="HTML",
+            reply_markup=cancel_menu(),
+        )
+        return True
+
+    if state == ST_EDIT_SMM_RATE:
+        sid = int(context.user_data.get("edit_sid", 0))
+        s = get_service(sid)
+        if text == "." and s:
+            rate = get_sell_rate_per_1k(s)
+        else:
+            try:
+                rate = float(text)
+                if rate <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("সঠিক সংখ্যা লিখুন:", reply_markup=cancel_menu())
+                return True
+        context.user_data["edit_rate"] = rate
+        context.user_data["state"] = ST_EDIT_SMM_MIN
+        await update.message.reply_text(
+            f"📉 <b>ধাপ ৫/৮:</b> সর্বনিম্ন অর্ডার (<b>Min Quantity</b>) লিখুন (বর্তমান: <code>{s['min_qty'] if s else 0}</code>, অপরিবর্তিত রাখতে <code>.</code> দিন):",
+            parse_mode="HTML",
+            reply_markup=cancel_menu(),
+        )
+        return True
+
+    if state == ST_EDIT_SMM_MIN:
+        sid = int(context.user_data.get("edit_sid", 0))
+        s = get_service(sid)
+        if text == "." and s:
+            mn = int(s["min_qty"])
+        else:
+            try:
+                mn = int(text)
+                if mn < 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("সঠিক পূর্ণসংখ্যা লিখুন (যেমন: 100 বা 0):", reply_markup=cancel_menu())
+                return True
+        context.user_data["edit_min"] = mn
+        context.user_data["state"] = ST_EDIT_SMM_MAX
+        await update.message.reply_text(
+            f"📈 <b>ধাপ ৬/৮:</b> সর্বোচ্চ অর্ডার (<b>Max Quantity</b>) লিখুন (বর্তমান: <code>{'unlimited' if (s and int(s['max_qty']) == -1) else (s['max_qty'] if s else 0)}</code>, আনলিমিটেড হলে <code>unlimited</code>, অপরিবর্তিত রাখতে <code>.</code> দিন):",
+            parse_mode="HTML",
+            reply_markup=cancel_menu(),
+        )
+        return True
+
+    if state == ST_EDIT_SMM_MAX:
+        sid = int(context.user_data.get("edit_sid", 0))
+        s = get_service(sid)
+        if text == "." and s:
+            mx = int(s["max_qty"])
+        else:
+            try:
+                mx = _parse_max_input(text)
+            except ValueError:
+                await update.message.reply_text("সঠিক সংখ্যা অথবা unlimited লিখুন:", reply_markup=cancel_menu())
+                return True
+        context.user_data["edit_max"] = mx
+        context.user_data["state"] = ST_EDIT_SMM_REFILL
+        await update.message.reply_text(
+            f"🔄 <b>ধাপ ৭/৮:</b> এই সার্ভিসের <b>Refill</b> তথ্য লিখুন (বর্তমান: <code>{get_refill_label(s) if s else 'No Refill'}</code>, অপরিবর্তিত রাখতে <code>.</code> দিন):",
+            parse_mode="HTML",
+            reply_markup=cancel_menu(),
+        )
+        return True
+
+    if state == ST_EDIT_SMM_REFILL:
+        sid = int(context.user_data.get("edit_sid", 0))
+        s = get_service(sid)
+        if text == "." and s:
+            ref_en = int(s["refill_enabled"] or 0)
+            ref_label = get_refill_label(s)
+        else:
+            ref_en, ref_label = _parse_refill_input(text)
+        context.user_data["edit_refill"] = ref_en
+        context.user_data["edit_refill_type"] = ref_label
+        context.user_data["state"] = ST_EDIT_SMM_ACTIVE
+        await update.message.reply_text(
+            "✅ <b>ধাপ ৮/৮:</b> সার্ভিসটি কি চালু (Active) রাখবেন? (চালু রাখতে <code>1</code>, বন্ধ রাখতে <code>0</code>):",
+            parse_mode="HTML",
+            reply_markup=cancel_menu(),
+        )
+        return True
+
+    if state == ST_EDIT_SMM_ACTIVE:
+        if text not in ("0", "1"):
+            await update.message.reply_text("শুধুমাত্র 1 অথবা 0 লিখুন:", reply_markup=cancel_menu())
             return True
-        context.user_data["f_price"] = pr
-        context.user_data["state"] = ST_ADD_FILE_DESC
-        await update.message.reply_text("📝 প্রোডাক্টের বিবরণ লিখুন:", reply_markup=cancel_menu())
-        return True
-
-    if state == ST_ADD_FILE_DESC:
-        context.user_data["f_desc"] = text
-        context.user_data["state"] = ST_ADD_FILE_DOC
-        await update.message.reply_text(
-            "📎 এবার ফাইলটি (Document হিসেবে) পাঠান, অথবা ফাইল ছাড়া সেভ করতে <code>skip</code> লিখুন:",
-            parse_mode="HTML",
-            reply_markup=cancel_menu(),
-        )
-        return True
-
-    if state == ST_ADD_FILE_DOC and text.lower() == "skip":
-        name = context.user_data.get("f_name", "Premium File")
-        pr = float(context.user_data.get("f_price", 100))
-        desc = context.user_data.get("f_desc", "")
+        sid = int(context.user_data.get("edit_sid", 0))
+        s = get_service(sid)
+        name = str(context.user_data.get("edit_name") or (s["name"] if s else "SMM Service"))
+        pid = int(context.user_data.get("edit_pid", 0))
+        prate = float(context.user_data.get("edit_prate", 0.0))
+        rate = float(context.user_data.get("edit_rate", 100.0))
+        mn = int(context.user_data.get("edit_min", 0))
+        mx = int(context.user_data.get("edit_max", 0))
+        refill_en = int(context.user_data.get("edit_refill", 0))
+        refill_type = str(context.user_data.get("edit_refill_type", "No Refill"))
+        is_act = int(text)
+        mk = round(rate - prate, 4) if prate > 0 else 0.0
         context.user_data.clear()
         with _db_lock, db() as conn:
             conn.execute(
                 """
-                INSERT INTO services
-                (category, name, service_type, rate_per_1k, min_qty, max_qty, description, file_id)
-                VALUES ('📁 VIP Digital Files', ?, 'file', ?, 1, 1, ?, NULL)
+                UPDATE services
+                SET name = ?, panel_service_id = ?, panel_rate = ?, markup = ?, rate_per_1k = ?,
+                    min_qty = ?, max_qty = ?, refill_enabled = ?, refill_type = ?, is_active = ?
+                WHERE id = ?
                 """,
-                (name, pr, desc),
+                (name, pid, prate, mk, rate, mn, mx, refill_en, refill_type, is_act, sid),
             )
             conn.commit()
         await update.message.reply_text(
-            f"✅ প্রোডাক্ট অ্যাড হয়েছে (ফাইল ছাড়া): {name} — ৳{pr:.0f}",
+            f"✅ <b>সার্ভিস #{sid} ({name}) সফলভাবে আপডেট হয়েছে!</b>\n"
+            f"🌐 Panel Service ID: <code>#{pid}</code>\n"
+            f"💵 Panel Rate: {_fmt_num(prate)}/1000 | 💰 Sell Price: ৳{_fmt_num(rate)}/1000\n"
+            f"📉 Min: {mn if mn > 0 else 'Editable'} | 📈 Max: {'Unlimited' if mx == -1 else (mx if mx > 0 else 'Editable')}\n"
+            f"🔄 Refill: {refill_type} | Active: {is_act}",
+            parse_mode="HTML",
             reply_markup=admin_menu(),
         )
         return True
@@ -1970,7 +3917,9 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
             return True
         target_uid = int(context.user_data.get("bal_uid", 0))
         context.user_data.clear()
-        new_b = add_balance(target_uid, delta)
+        new_b = add_balance(
+            target_uid, delta, reason="Admin Manual Balance Adjustment"
+        )
         await update.message.reply_text(
             f"✅ User <code>{target_uid}</code> এর ব্যালেন্স আপডেট হয়েছে!\n"
             f"💳 বর্তমান ব্যালেন্স: <b>৳{new_b:.2f}</b>",
@@ -1999,7 +3948,6 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
         ST_SET_ROCKET,
         ST_SET_BINANCE,
         ST_SET_SUPPORT,
-        ST_SET_REFER_BONUS,
         ST_SET_DAILY_BONUS,
     ):
         key_map = {
@@ -2008,7 +3956,6 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
             ST_SET_ROCKET: ("rocket_number", "Rocket Number"),
             ST_SET_BINANCE: ("binance_id", "Binance Pay ID"),
             ST_SET_SUPPORT: ("support_username", "Support Username"),
-            ST_SET_REFER_BONUS: ("refer_bonus", "Refer Bonus (৳)"),
             ST_SET_DAILY_BONUS: ("daily_bonus", "Daily Bonus (৳)"),
         }
         k, label = key_map[state]
@@ -2049,31 +3996,7 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not is_admin(user.id) or context.user_data.get("state") != ST_ADD_FILE_DOC:
-        return
-    if not update.message.document:
-        return
-    fid = update.message.document.file_id
-    name = context.user_data.get("f_name", "Premium File")
-    pr = float(context.user_data.get("f_price", 100))
-    desc = context.user_data.get("f_desc", "")
-    context.user_data.clear()
-    with _db_lock, db() as conn:
-        conn.execute(
-            """
-            INSERT INTO services
-            (category, name, service_type, rate_per_1k, min_qty, max_qty, description, file_id)
-            VALUES ('📁 VIP Digital Files', ?, 'file', ?, 1, 1, ?, ?)
-            """,
-            (name, pr, desc, fid),
-        )
-        conn.commit()
-    await update.message.reply_text(
-        f"✅ <b>ফাইল প্রোডাক্ট অ্যাড হয়েছে (অটো-ডেলিভারি সহ):</b>\n📦 {name} — ৳{pr:.0f}",
-        parse_mode="HTML",
-        reply_markup=admin_menu(),
-    )
+    return
 
 
 async def handle_admin_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2088,7 +4011,6 @@ async def handle_admin_settings_cb(update: Update, context: ContextTypes.DEFAULT
         "adm_set_rocket": (ST_SET_ROCKET, "💜 নতুন <b>Rocket Number</b> লিখে পাঠান:"),
         "adm_set_binance": (ST_SET_BINANCE, "🟡 নতুন <b>Binance Pay ID / USDT Address</b> লিখে পাঠান:"),
         "adm_set_support": (ST_SET_SUPPORT, "🛟 <b>Support Username</b> লিখুন (@ ছাড়া):"),
-        "adm_set_refer": (ST_SET_REFER_BONUS, "🎁 প্রতি রেফারে কত টাকা বোনাস দিবেন? (সংখ্যা লিখুন, যেমন: 2):"),
         "adm_set_daily": (ST_SET_DAILY_BONUS, "🎯 ডেইলি বোনাস কত টাকা দিবেন? (সংখ্যা লিখুন, যেমন: 1):"),
     }
     if data in prompts:
@@ -2121,27 +4043,33 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     action = str(data.get("type") or data.get("action") or "").strip()
 
-    # 1. Mini App Admin Add Product/Service
+    # 1. Mini App Admin Add Service
     if action == "add_product" and is_admin(user.id):
         pname = str(data.get("name", "")).strip()
-        pdesc = str(data.get("desc", "")).strip()
+        pdesc = str(data.get("desc", "")).strip() or "⏱️ Average time: 2-6 hours"
         try:
             pprice = float(data.get("price", 100))
         except (ValueError, TypeError):
             pprice = 100.0
-        if pname and pprice > 0:
+        try:
+            pid = int(data.get("panel_service_id", 0) or 0)
+        except (ValueError, TypeError):
+            pid = 0
+        if pname and pprice > 0 and pid > 0:
             with _db_lock, db() as conn:
                 conn.execute(
                     """
                     INSERT INTO services
-                    (category, name, service_type, rate_per_1k, min_qty, max_qty, description, file_id)
-                    VALUES ('🌟 Mini App VIP', ?, 'smm', ?, 100, 100000, ?, NULL)
+                    (category, name, service_type, rate_per_1k, min_qty, max_qty, description,
+                     file_id, panel_service_id, refill_enabled, refill_type, avg_time,
+                     panel_rate, markup, is_active)
+                    VALUES ('📸 Instagram', ?, 'smm', ?, 0, 0, ?, NULL, ?, 0, 'No Refill', '2-6 hours', 0.0, 0.0, 1)
                     """,
-                    (pname, pprice, pdesc),
+                    (pname, pprice, pdesc, pid),
                 )
                 conn.commit()
             await update.message.reply_text(
-                f"✅ Mini App থেকে সার্ভিস অ্যাড হয়েছে: {pname} — ৳{pprice:.0f}"
+                f"✅ Mini App থেকে সার্ভিস অ্যাড হয়েছে: {pname} — ৳{_fmt_num(pprice)}/1000 (Panel ID #{pid})"
             )
         return
 
@@ -2199,46 +4127,113 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 pass
         return
 
-    # 3. Mini App Order
-    name = str(data.get("product") or data.get("product_name") or "").strip()
-    link = str(data.get("link") or data.get("target_link") or "Mini App Order").strip()
+    # 3. Mini App Order (Enforces Panel API & panel_service_id checks)
+    sid = int(data.get("service_id", 0) or 0)
+    s = get_service(sid) if sid else None
+    name = str(data.get("product") or data.get("product_name") or (s["name"] if s else "")).strip()
+    link = str(data.get("link") or data.get("target_link") or "").strip()
     try:
         qty = int(data.get("quantity", 1) or 1)
     except (ValueError, TypeError):
         qty = 1
-    try:
-        price = float(data.get("price", 0) or 0)
-    except (ValueError, TypeError):
-        price = 0.0
 
-    if not name:
-        return
-
-    bal = get_balance(user.id)
-    if bal < price:
+    if not s or int(s["panel_service_id"] or 0) <= 0:
         await update.message.reply_text(
-            f"⚠️ ব্যালেন্স কম! প্রয়োজন ৳{price:.2f}, আপনার আছে ৳{bal:.2f}। আগে ডিপোজিট করুন।"
+            "⚠️ এই সার্ভিসটি বর্তমানে অর্ডারের জন্য উপলব্ধ নয়।"
         )
         return
 
-    add_balance(user.id, -price)
-    record_spend(user.id, price)
+    api_url, api_key = _get_smm_api_config()
+    if not api_url or not api_key:
+        await update.message.reply_text("⚠️ Panel API not set - contact admin")
+        return
+
+    valid_link, link_err = validate_service_link(s["category"], s["name"], link)
+    if not valid_link:
+        await update.message.reply_text(link_err, parse_mode="HTML")
+        return
+
+    min_q = int(s["min_qty"] or 0)
+    max_q = int(s["max_qty"] or 0)
+    if qty <= 0 or (min_q > 0 and qty < min_q) or (max_q > 0 and qty > max_q):
+        await update.message.reply_text(
+            f"⚠️ পরিমাণ সঠিক নয় ({format_min_max(s)})!"
+        )
+        return
+
+    sell_price = calc_sell_price(s, qty)
+    panel_cost = calc_panel_cost(s, qty)
+    bal = get_balance(user.id)
+    if bal < sell_price:
+        await update.message.reply_text(
+            f"⚠️ ব্যালেন্স কম! প্রয়োজন ৳{sell_price:.2f}, আপনার আছে ৳{bal:.2f}। আগে ডিপোজিট করুন।"
+        )
+        return
+
+    pbal_res = panel_balance()
+    if not pbal_res.get("ok") or float(pbal_res.get("balance", 0.0)) < panel_cost:
+        await update.message.reply_text(
+            "⚠️ প্যানেলে পর্যাপ্ত ব্যালেন্স নেই বা প্যানেল সংযোগ ব্যর্থ হয়েছে। কোনো টাকা কাটা হয়নি।"
+        )
+        return
+
+    pid = int(s["panel_service_id"])
+    add_res = panel_add_order(pid, link, qty)
+    if not add_res.get("ok"):
+        await update.message.reply_text(
+            f"❌ প্যানেল অর্ডার গ্রহণ করেনি: {add_res.get('error')}\nকোনো টাকা কাটা হয়নি।"
+        )
+        return
+
+    panel_oid = int(add_res["order"])
+    add_balance(
+        user.id, -sell_price, reason=f"Mini App Order ({name} x{qty})"
+    )
+    record_spend(user.id, sell_price)
     with _db_lock, db() as conn:
         cur = conn.execute(
             """
             INSERT INTO orders
-            (service_id, service_name, buyer_id, buyer_name, target_link, quantity, price, status)
-            VALUES (0, ?, ?, ?, ?, ?, ?, 'pending')
+            (service_id, service_name, buyer_id, buyer_name, target_link, quantity,
+             price, status, panel_order_id, panel_service_id, panel_cost, sell_price,
+             starts_count, remains, refunded, refer_bonus_paid)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?, ?, ?, 0, ?, 0, 0)
             """,
-            (name, user.id, user.first_name or "User", link, qty, price),
+            (
+                s["id"],
+                name,
+                user.id,
+                user.first_name or "User",
+                link,
+                qty,
+                sell_price,
+                panel_oid,
+                pid,
+                panel_cost,
+                sell_price,
+                qty,
+            ),
         )
         oid = cur.lastrowid
         conn.commit()
 
+    schedule_order_sheet_backup(oid)
+
     await update.message.reply_text(
-        f"✅ Mini App অর্ডার সফল (#SMM-{oid})!\n📦 {name}\n💰 ৳{price:.2f}"
+        f"✅ Mini App অর্ডার সফল (#SMM-{oid} | Panel #{panel_oid})!\n📦 {name}\n💰 ৳{sell_price:.2f}"
     )
-    await notify_admin_new_order(context, oid, name, user, link, qty, price)
+    await notify_admin_new_order(
+        context,
+        oid,
+        name,
+        user,
+        link,
+        qty,
+        sell_price,
+        panel_order_id=panel_oid,
+        panel_service_id=pid,
+        panel_cost=panel_cost,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2258,6 +4253,8 @@ ALL_MENU_BUTTONS = {
     BTN_ADMIN,
     BTN_BACK,
     BTN_A_ADD_SMM,
+    BTN_A_EDIT_SMM,
+    BTN_A_USERS,
     BTN_A_ADD_FILE,
     BTN_A_LIST,
     BTN_A_DEL,
@@ -2356,28 +4353,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context.user_data["state"] = ST_ADD_SMM_CAT
             await update.message.reply_text(
                 "➕ <b>নতুন SMM সার্ভিস অ্যাড:</b>\n\n"
-                "💠 প্রথমে ক্যাটাগরির নাম লিখুন (যেমন: <code>📘 Facebook VIP</code> বা <code>🎵 TikTok Viral</code>):",
+                "💠 প্রথমে ক্যাটাগরির নাম লিখুন (যেমন: <code>📸 Instagram</code>, <code>🎵 TikTok</code>, <code>📘 Facebook</code>, <code>▶️ YouTube</code>):",
                 parse_mode="HTML",
                 reply_markup=cancel_menu(),
             )
             return
 
-        if text == BTN_A_ADD_FILE:
-            context.user_data["state"] = ST_ADD_FILE_NAME
-            await update.message.reply_text(
-                "📁 <b>নতুন ফাইল প্রোডাক্ট অ্যাড:</b>\n\n"
-                "📦 প্রোডাক্টের নাম লিখুন:",
-                parse_mode="HTML",
-                reply_markup=cancel_menu(),
-            )
-            return
-
-        if text == BTN_A_LIST:
-            await show_all_services_list(update, context)
-            return
-
-        if text == BTN_A_DEL:
-            svcs = list_services()
+        if text == BTN_A_EDIT_SMM:
+            svcs = list_services(include_disabled=True)
             if not svcs:
                 await update.message.reply_text("কোনো সার্ভিস নেই।", reply_markup=admin_menu())
                 return
@@ -2385,7 +4368,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 [
                     [
                         InlineKeyboardButton(
-                            f"🗑️ #{s['id']} {s['name']} (৳{s['rate_per_1k']:.0f})",
+                            f"✏️ #{s['id']} {s['name']} (PID:{s['panel_service_id']} | ৳{_fmt_num(get_sell_rate_per_1k(s))})",
+                            callback_data=f"edit_{s['id']}",
+                        )
+                    ]
+                    for s in svcs
+                ]
+            )
+            await update.message.reply_text(
+                "✏️ <b>যে সার্ভিসটির Name / Panel ID / Rate / Min / Max / Refill এডিট করতে চান সেটিতে চাপুন:</b>",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+            return
+
+        if text == BTN_A_USERS:
+            await admin_show_all_users(update, context)
+            return
+
+        if text == BTN_A_LIST:
+            await show_all_services_list(update, context)
+            return
+
+        if text == BTN_A_DEL:
+            svcs = list_services(include_disabled=True)
+            if not svcs:
+                await update.message.reply_text("কোনো সার্ভিস নেই।", reply_markup=admin_menu())
+                return
+            kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            f"🗑️ #{s['id']} {s['name']} (৳{_fmt_num(get_sell_rate_per_1k(s))})",
                             callback_data=f"del_{s['id']}",
                         )
                     ]
@@ -2444,18 +4458,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     ],
                     [
                         InlineKeyboardButton(
-                            "🎁 Refer Bonus সেট", callback_data="adm_set_refer"
-                        ),
-                        InlineKeyboardButton(
                             "🎯 Daily Bonus সেট", callback_data="adm_set_daily"
-                        ),
+                        )
                     ],
                 ]
             )
             await update.message.reply_text(
                 "🎁 <b>বোনাস ও সাপোর্ট সেটিংস:</b>\n"
                 f"├─ Support: @{get_setting('support_username', 'Not Set')}\n"
-                f"├─ Refer Bonus: ৳{get_setting('refer_bonus', '2')}\n"
                 f"└─ Daily Bonus: ৳{get_setting('daily_bonus', '1')}",
                 parse_mode="HTML",
                 reply_markup=kb,
@@ -2500,7 +4510,7 @@ def ping():
 
 @app.route("/api/services")
 def api_services():
-    svcs = list_services()
+    svcs = list_services(include_disabled=False)
     return jsonify(
         {
             "services": [
@@ -2509,10 +4519,15 @@ def api_services():
                     "category": s["category"],
                     "name": s["name"],
                     "type": s["service_type"],
-                    "rate_per_1k": s["rate_per_1k"],
+                    "rate_per_1k": get_sell_rate_per_1k(s),
                     "min_qty": s["min_qty"],
                     "max_qty": s["max_qty"],
                     "description": s["description"],
+                    "panel_service_id": s["panel_service_id"],
+                    "refill_enabled": s["refill_enabled"],
+                    "refill_type": get_refill_label(s),
+                    "avg_time": get_avg_time_label(s),
+                    "linked": int(s["panel_service_id"] or 0) > 0,
                 }
                 for s in svcs
             ]
@@ -2530,7 +4545,7 @@ def api_balance():
         return jsonify({"error": "user_id required"}), 400
     with _db_lock, db() as conn:
         rows = conn.execute(
-            "SELECT id, service_id, service_name, status, price FROM orders WHERE buyer_id = ? ORDER BY id DESC LIMIT 20",
+            "SELECT id, service_id, service_name, status, price, panel_order_id FROM orders WHERE buyer_id = ? ORDER BY id DESC LIMIT 20",
             (uid,),
         ).fetchall()
     return jsonify(
@@ -2541,8 +4556,9 @@ def api_balance():
                     "id": r["id"],
                     "product_id": r["service_id"],
                     "service_name": r["service_name"],
-                    "status": "approved" if r["status"] == "completed" else r["status"],
+                    "status": "approved" if str(r["status"]).lower() == "completed" else str(r["status"]).lower(),
                     "price": r["price"],
+                    "panel_order_id": r["panel_order_id"],
                 }
                 for r in rows
             ],
@@ -2561,7 +4577,7 @@ def download_product(product_id: int):
         return "File not found", 404
     with _db_lock, db() as conn:
         ok = conn.execute(
-            "SELECT 1 FROM orders WHERE service_id = ? AND buyer_id = ? AND status IN ('completed','approved') LIMIT 1",
+            "SELECT 1 FROM orders WHERE service_id = ? AND buyer_id = ? AND LOWER(status) IN ('completed','approved') LIMIT 1",
             (product_id, uid),
         ).fetchone()
     if not ok:
@@ -2624,7 +4640,13 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(
             handle_category_And_service_cb,
-            pattern="^(open_cats|open_deposit|cat_[0-9]+|srv_[0-9]+|buyfile_[0-9]+)$",
+            pattern="^(open_cats|open_deposit|cat_[0-9]+|srv_[0-9]+|order_confirm_cb|order_cancel_cb)$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            handle_user_order_actions_cb,
+            pattern="^(usr_chk_[0-9]+|usr_drop_[0-9]+|usr_refill_[0-9]+)$",
         )
     )
     application.add_handler(
@@ -2636,11 +4658,14 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(
             handle_admin_decisions_cb,
-            pattern="^(approve_bal_|reject_bal_|ord_proc_|ord_comp_|ord_canc_|approve_|reject_)",
+            pattern="^(approve_bal_|reject_bal_|ord_proc_|ord_comp_|ord_canc_|approve_|reject_|adm_chk_|adm_ref_|adm_export_users$)",
         )
     )
     application.add_handler(
         CallbackQueryHandler(handle_delete_service_cb, pattern="^del_[0-9]+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(handle_edit_service_cb, pattern="^edit_[0-9]+$")
     )
     application.add_handler(
         CallbackQueryHandler(handle_admin_settings_cb, pattern="^adm_set_")
