@@ -2042,6 +2042,20 @@ async def handle_force_check_cb(update, context) -> None:
 # ---------------------------------------------------------------------------
 # Main Welcome & Dashboard (/start) — No Quick Action Panel
 # ---------------------------------------------------------------------------
+
+def _welcome_banner_path():
+    """Welcome banner lookup: env WELCOME_BANNER_PATH, then banner.png / banner.jpg next to bot.py. None if missing."""
+    env = os.environ.get("WELCOME_BANNER_PATH", "").strip()
+    if env and os.path.isfile(env):
+        return env
+    base = os.path.dirname(os.path.abspath(__file__))
+    for _name in ("banner.png", "banner.jpg"):
+        _p = os.path.join(base, _name)
+        if os.path.isfile(_p):
+            return _p
+    return None
+
+
 async def show_main_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     u = ensure_user(user.id, user.username or "", user.first_name or "User")
@@ -2069,9 +2083,22 @@ async def show_main_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     if update.message:
-        await update.message.reply_text(
-            text, parse_mode="HTML", reply_markup=main_menu(user.id)
-        )
+        _banner = _welcome_banner_path()
+        _sent_photo = False
+        if _banner:
+            try:
+                with open(_banner, "rb") as _f:
+                    await update.message.reply_photo(
+                        photo=_f, caption=text, parse_mode="HTML",
+                        reply_markup=main_menu(user.id),
+                    )
+                _sent_photo = True
+            except Exception:
+                _sent_photo = False
+        if not _sent_photo:
+            await update.message.reply_text(
+                text, parse_mode="HTML", reply_markup=main_menu(user.id)
+            )
     elif update.callback_query:
         # Callback edits cannot carry a reply keyboard (Bot API editMessageText
         # accepts only an inline keyboard). Send the dashboard as a fresh
@@ -2083,9 +2110,22 @@ async def show_main_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.callback_query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await context.bot.send_message(
-            chat_id=user.id, text=text, parse_mode="HTML", reply_markup=main_menu(user.id)
-        )
+        _banner = _welcome_banner_path()
+        _sent_photo = False
+        if _banner:
+            try:
+                with open(_banner, "rb") as _f:
+                    await context.bot.send_photo(
+                        chat_id=user.id, photo=_f, caption=text, parse_mode="HTML",
+                        reply_markup=main_menu(user.id),
+                    )
+                _sent_photo = True
+            except Exception:
+                _sent_photo = False
+        if not _sent_photo:
+            await context.bot.send_message(
+                chat_id=user.id, text=text, parse_mode="HTML", reply_markup=main_menu(user.id)
+            )
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
