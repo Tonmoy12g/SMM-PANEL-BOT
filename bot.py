@@ -622,7 +622,7 @@ def _mkb(text: str, style: str = "primary", web_app: WebAppInfo | None = None) -
 # ---------------------------------------------------------------------------
 # Button Labels (User & Admin)
 # ---------------------------------------------------------------------------
-BTN_NEW_ORDER = "🚀 নতুন অর্ডার"
+BTN_NEW_ORDER = "অর্ডার করুন"
 BTN_MINIAPP = "📱 Mini Bot Open"
 BTN_SERVICES = "📋 সার্ভিস লিস্ট"
 BTN_DEPOSIT = "💰 ডিপোজিট"
@@ -1903,11 +1903,13 @@ def payment_numbers_text() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main Menu: নতুন অর্ডার, সার্ভিস লিস্ট, ডিপোজিট, আমার অর্ডার, প্রোফাইল, রেফারেল, সাপোর্ট, লিডারবোর্ড (+ অ্যাডমিন প্যানেল for admin only)
+# Main Menu: অর্ডার করুন, ডিপোজিট, আমার অর্ডার, প্রোফাইল, রেফারেল, সাপোর্ট, লিডারবোর্ড (+ অ্যাডমিন প্যানেল for admin only)
+# NOTE: No standalone Service List button on the main menu (removed 2026-10-29);
+# services are still picked inside the অর্ডার করুন flow (platform > service).
 # ---------------------------------------------------------------------------
 def main_menu(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
-        [_mkb(BTN_NEW_ORDER, "danger"), _mkb(BTN_SERVICES, "primary")],
+        [_mkb(BTN_NEW_ORDER, "primary")],
         [_mkb(BTN_DEPOSIT, "success"), _mkb(BTN_MY_ORDERS, "primary")],
         [_mkb(BTN_PROFILE, "primary"), _mkb(BTN_REFER, "success")],
         [_mkb(BTN_SUPPORT, "primary"), _mkb(BTN_LEADERBOARD, "success")],
@@ -2127,8 +2129,45 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # SMM Categories & Easy-to-Read Service Listing
 # ---------------------------------------------------------------------------
 def build_categories_keyboard() -> InlineKeyboardMarkup:
+    """Platform-selection grid for step 1/5 of the order flow (DMR-style layout).
+
+    Grid (button labels and callback_data UNCHANGED, only the row layout changes):
+        Row 1: Facebook | Telegram
+        Row 2: Instagram | TikTok
+        Row 3: YouTube (alone)
+        Row 4: প্রধান মেনু (full width)
+    Callback data stays f"cat_{idx}" where idx is the category's position in
+    list_categories(), so the existing cat_ handler routing is untouched.
+    A category that is disabled/missing is simply skipped; any unknown
+    category is appended as its own row before প্রধান মেনু, so no platform
+    can silently disappear from this keyboard.
+    """
     cats = list_categories(include_disabled=False)
-    rows = [[InlineKeyboardButton(c, callback_data=f"cat_{idx}")] for idx, c in enumerate(cats)]
+    by_platform: dict[str, tuple[int, str]] = {}
+    unknown: list[tuple[int, str]] = []
+    for idx, c in enumerate(cats):
+        low = (c or "").lower()
+        key = None
+        for name in ("facebook", "telegram", "instagram", "tiktok", "youtube"):
+            if name in low:
+                key = name
+                break
+        if key is None:
+            unknown.append((idx, c))
+        elif key not in by_platform:
+            by_platform[key] = (idx, c)
+    rows: list[list] = []
+    for pair in (("facebook", "telegram"), ("instagram", "tiktok"), ("youtube",)):
+        row = []
+        for name in pair:
+            if name in by_platform:
+                idx, c = by_platform[name]
+                row.append(InlineKeyboardButton(c, callback_data=f"cat_{idx}"))
+        if row:
+            rows.append(row)
+    for idx, c in unknown:
+        rows.append([InlineKeyboardButton(c, callback_data=f"cat_{idx}")])
+    rows.append([InlineKeyboardButton("প্রধান মেনু", callback_data="open_main_menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2146,7 +2185,7 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     text = (
         "🚀 <b>𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🛒 <b>নতুন অর্ডার — ধাপ ১/৫: প্ল্যাটফর্ম বাছুন</b>\n"
+        "🛒 <b>অর্ডার করুন — ধাপ ১/৫: প্ল্যাটফর্ম বাছুন</b>\n"
         "⏱️ <b>Average time:</b> 2-6 hours\n\n"
         "👇 আপনি কোন প্ল্যাটফর্মের সার্ভিস নিতে চান? নিচ থেকে সিলেক্ট করুন:"
     )
@@ -2263,6 +2302,14 @@ async def handle_category_And_service_cb(
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+
+    if data == "open_main_menu":
+        # Main Menu from the platform grid: show_main_dashboard's callback
+        # branch strips the old message's inline buttons and sends the
+        # dashboard as a fresh message carrying the reply keyboard (an
+        # edited message cannot carry a reply keyboard).
+        await show_main_dashboard(update, context)
+        return
 
     if data == "open_cats":
         await show_categories(update, context)
@@ -3526,7 +3573,7 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not rows:
         await update.message.reply_text(
             "📦 <b>আপনার এখনো কোনো অর্ডার নেই।</b>\n\n"
-            "অর্ডার করতে <b>🚀 নতুন অর্ডার</b> বাটনে ক্লিক করুন!",
+            "অর্ডার করতে <b>অর্ডার করুন</b> বাটনে ক্লিক করুন!",
             parse_mode="HTML",
             reply_markup=main_menu(uid),
         )
@@ -5269,9 +5316,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if text in (BTN_SERVICES, "সার্ভিস লিস্ট"):
+        # Standalone Service List button removed from main menu (2026-10-29).
+        # Old text kept harmless: it now opens the অর্ডার করুন flow, where
+        # services are picked (platform > service). show_all_services_list
+        # is retained but no longer reachable from the main menu.
         if not await ensure_force_join(update, context):
             return
-        await show_all_services_list(update, context)
+        await show_categories(update, context)
         return
 
     if text in (BTN_MY_ORDERS, "আমার অর্ডার"):
@@ -5663,7 +5714,7 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(
             handle_category_And_service_cb,
-            pattern="^(open_cats|open_deposit|cat_[0-9]+|srv_[0-9]+|order_confirm_cb|order_cancel_cb)$",
+            pattern="^(open_main_menu|open_cats|open_deposit|cat_[0-9]+|srv_[0-9]+|order_confirm_cb|order_cancel_cb)$",
         )
     )
     application.add_handler(
