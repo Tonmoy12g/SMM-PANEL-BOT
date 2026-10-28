@@ -9,7 +9,7 @@ Features:
       - panel_balance(), panel_add_order(), panel_status(), panel_refill()
       - Platform URL validation, Min/Max validation, Confirm/Cancel step, user & panel balance verification
       - Live status check in My Orders with auto-refund on Partial/Cancelled and conditional Refill button
-  • 13 Linked Active SMM Services (Instagram, TikTok, Facebook, YouTube) — all average time 2-6 hours
+  • 16 Linked Active SMM Services (Instagram, TikTok, Facebook, YouTube, Telegram) — all average time 2-6 hours
   • Referral System: 10% bonus on referred user's COMPLETED order amount only (never on join; shown only in Refer menu)
   • Manual bKash/Nagad/Rocket Personal Send Money Deposit (Paid File bot style, method first) with TrxID duplicate check & 1-Click Admin Approve/Reject
   • 100% Hidden Admin Panel (ONLY visible to ADMIN_ID):
@@ -548,6 +548,8 @@ def panel_refill(panel_order_id: int) -> dict:
 def detect_required_platform(category: str, service_name: str) -> tuple[str, tuple[str, ...]] | None:
     """Determines required platform domains from service category and name."""
     combined = f"{category} {service_name}".lower()
+    if "telegram" in combined:
+        return ("Telegram (t.me)", ("t.me",))
     if "facebook" in combined or "fb " in combined or combined.startswith("fb"):
         return ("Facebook (facebook.com / fb.watch)", ("facebook.com", "fb.com", "fb.watch", "m.facebook.com"))
     if "tiktok" in combined:
@@ -709,15 +711,16 @@ def db() -> sqlite3.Connection:
     return conn
 
 
-# Exact 13 Active Services:
-# - All 13 are linked with their real panel_service_id
-# - Average time display = 2-6 hours for all 13
+# Exact 16 Active Services:
+# - All 16 are linked with their real panel_service_id
+# - Average time display = 2-6 hours for all 16
 # - Sell price (rate_per_1k) is what the customer pays
 # - Where Min is not listed, min_qty = 0 (editable in Admin, never invented)
 # - Where Max is unlimited, max_qty = -1; where Max is not listed, max_qty = 0 (editable in Admin)
 # - Facebook Reaction (Love) is clearly labeled Bot Data
-# - No Telegram services, no YouTube Subscribers, no premium services
-ACTIVE_13_SERVICES = [
+# - Telegram services added in bot__19: Members (10752), Mix Positive Reactions (7856), Post Views (10087) only
+# - No YouTube Subscribers, no premium services, no Poll Vote, no Bot Start
+ACTIVE_16_SERVICES = [
     # (category, name, service_type, rate_per_1k, min_qty, max_qty, description, file_id,
     #  panel_service_id, refill_enabled, refill_type, avg_time, panel_rate, markup, is_active)
     # --- Instagram (1-4) ---
@@ -945,28 +948,78 @@ ACTIVE_13_SERVICES = [
         round(90.0 - 79.248, 4),
         1,
     ),
+    # --- Telegram (14-16, added in bot__19) ---
+    (
+        "✈️ Telegram",
+        "Telegram Members",
+        "smm",
+        100.0,
+        10,
+        1000000,
+        "⏱️ Average time: 2-6 hours | 🔄 LifeTime refill | Drop may happen, refill only if panel provides it. | 🔗 চ্যানেল/গ্রুপ লিংক দিন (যেমন: https://t.me/ChannelName)",
+        None,
+        10752,
+        1,
+        "LifeTime refill",
+        "2-6 hours",
+        75.933,
+        round(100.0 - 75.933, 4),
+        1,
+    ),
+    (
+        "✈️ Telegram",
+        "Telegram Mix Positive Reactions + Free Views",
+        "smm",
+        20.0,
+        10,
+        1000000,
+        "⏱️ Average time: 2-6 hours | 🚫 No Refill. | 🔗 পোস্ট লিংক দিন (যেমন: https://t.me/ChannelName/123) — চ্যানেল লিংক নয়। + Free Views সহ।",
+        None,
+        7856,
+        0,
+        "No Refill",
+        "2-6 hours",
+        5.59,
+        round(20.0 - 5.59, 4),
+        1,
+    ),
+    (
+        "✈️ Telegram",
+        "Telegram Post Views",
+        "smm",
+        2.0,
+        50,
+        2147483647,
+        "⏱️ Average time: 2-6 hours | 🚫 No Refill. | 🔗 পোস্ট লিংক দিন (যেমন: https://t.me/ChannelName/123) — চ্যানেল লিংক নয়।",
+        None,
+        10087,
+        0,
+        "No Refill",
+        "2-6 hours",
+        0.273,
+        round(2.0 - 0.273, 4),
+        1,
+    ),
 ]
 
 
-def _sync_active_13_services(conn: sqlite3.Connection) -> None:
+def _sync_active_16_services(conn: sqlite3.Connection) -> None:
     """
-    Ensures the 13 active services are present and linked, removes any legacy unlinked (panel_service_id = 0),
-    Telegram, YouTube Subscribers, or premium placeholder services, while keeping any custom linked services
-    added later by Admin via the Admin Panel.
+    Ensures the 16 active services are present and linked, removes any legacy unlinked (panel_service_id = 0),
+    YouTube Subscribers, or premium placeholder services, while keeping any custom linked services
+    added later by Admin via the Admin Panel. Telegram services are part of the 16 and are NOT deleted.
     """
     conn.execute(
         """
         DELETE FROM services
         WHERE panel_service_id = 0
-           OR LOWER(category) LIKE '%telegram%'
-           OR LOWER(name) LIKE '%telegram%'
            OR LOWER(name) LIKE '%subscriber%'
            OR LOWER(name) LIKE '%capcut%'
            OR service_type = 'file'
         """
     )
 
-    for item in ACTIVE_13_SERVICES:
+    for item in ACTIVE_16_SERVICES:
         (
             cat,
             name,
@@ -1175,7 +1228,7 @@ def init_db() -> None:
                 "ALTER TABLE orders ADD COLUMN refer_bonus_paid INTEGER NOT NULL DEFAULT 0"
             )
 
-        _sync_active_13_services(conn)
+        _sync_active_16_services(conn)
         conn.commit()
 
 
@@ -1286,6 +1339,8 @@ def service_price_unit(name: str) -> str:
     n = (name or "").lower()
     if "reaction" in n:
         return "Reaction"
+    if "members" in n or "member" in n:
+        return "Members"
     if "followers" in n:
         return "Followers"
     if "likes" in n:
@@ -1316,6 +1371,8 @@ def platform_emoji_for(category: str) -> str:
         return "📘"
     if "youtube" in c:
         return "▶️"
+    if "telegram" in c:
+        return "✈️"
     return "🔹"
 
 
@@ -2004,7 +2061,7 @@ async def show_main_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"📦 <b>মোট অর্ডার:</b> {order_cnt} টি\n"
         f"🏆 <b>ভিআইপি র‍্যাংক:</b> {badge}\n\n"
         "🔥 <b>অ্যাক্টিভ প্ল্যাটফর্মসমূহ (⏱️ Average time: 2-6 hours):</b>\n"
-        "📸 <b>Instagram</b> • 🎵 <b>TikTok</b> • 📘 <b>Facebook</b> • ▶️ <b>YouTube</b>\n"
+        "📸 <b>Instagram</b> • 🎵 <b>TikTok</b> • 📘 <b>Facebook</b> • ▶️ <b>YouTube</b> • ✈️ <b>Telegram</b>\n"
         "─────────\n"
         "👇 শুরু করতে নিচের মেনু থেকে বাটন সিলেক্ট করুন:"
     )
@@ -2285,6 +2342,13 @@ async def handle_category_And_service_cb(
         mm_txt = format_min_max(s, admin_view=False)
         req_plat = detect_required_platform(s["category"], s["name"])
         plat_hint = f" ({req_plat[0]})" if req_plat else ""
+        if "telegram" in (s["category"] or "").lower():
+            if "members" in (s["name"] or "").lower():
+                tg_hint = "\n🔗 <b>লিংক টাইপ:</b> চ্যানেল/গ্রুপ লিংক (যেমন: https://t.me/ChannelName)"
+            else:
+                tg_hint = "\n🔗 <b>লিংক টাইপ:</b> পোস্ট লিংক (যেমন: https://t.me/ChannelName/123) — চ্যানেল লিংক নয়"
+        else:
+            tg_hint = ""
         bot_data_line = (
             "🤖 <b>টাইপ:</b> Bot Data\n"
             if "bot data" in (s["name"] + " " + s["description"]).lower()
@@ -2304,7 +2368,7 @@ async def handle_category_And_service_cb(
             f"⏱️ <b>Average time:</b> {avg_t}\n"
             f"{bot_data_line}"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔗 <b>ধাপ ৩/৫: টার্গেট লিংক{plat_hint}</b> পাঠান:\n"
+            f"🔗 <b>ধাপ ৩/৫: টার্গেট লিংক{plat_hint}</b> পাঠান:{tg_hint}\n"
             "<i>(লিংক অবশ্যই http:// বা https:// দিয়ে শুরু হতে হবে এবং পাবলিক থাকতে হবে)</i>"
         )
         await query.edit_message_text(text, parse_mode="HTML")
@@ -4063,6 +4127,10 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return True
 
+        # Telegram: accept a bare t.me/... link by normalizing it to https://t.me/...
+        # so the panel always receives a full URL. Other platforms are unchanged.
+        if "telegram" in (s["category"] or "").lower() and text.strip().startswith("t.me/"):
+            text = "https://" + text.strip()
         valid, err_msg = validate_service_link(s["category"], s["name"], text)
         if not valid:
             await update.message.reply_text(
