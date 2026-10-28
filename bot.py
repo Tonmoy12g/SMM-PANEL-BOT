@@ -696,6 +696,7 @@ ST_SET_BINANCE = "set_binance"
 ST_SET_SUPPORT = "set_support"
 ST_SET_DAILY_BONUS = "set_daily_bonus"
 ST_SET_REFER_BONUS = "set_refer_bonus"
+ST_SET_FORCE_CHANNEL = "set_force_channel"
 ST_BROADCAST_TEXT = "broadcast_text"
 
 
@@ -1354,6 +1355,61 @@ def set_setting(key: str, value: str) -> None:
         conn.commit()
 
 
+def _clean_force_channel(raw: str) -> str:
+    """Clean a channel username: strip @, t.me/ links and whitespace. Returns '' if invalid."""
+    v = (raw or "").strip()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/", "@"):
+        if v.lower().startswith(prefix):
+            v = v[len(prefix):]
+            break
+    v = v.strip().lstrip("@").strip().rstrip("/")
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z0-9_]{5,32}", v or ""):
+        return ""
+    return v
+
+
+def get_force_channels() -> list:
+    """Force channels set by admin (list), with env fallback. Never hardcoded."""
+    import json as _json
+    raw = get_setting("force_channel", "") or get_setting("force_channels", "")
+    out = []
+    if raw:
+        raw = raw.strip()
+        if raw.startswith("["):
+            try:
+                vals = _json.loads(raw)
+                if isinstance(vals, list):
+                    out = [_clean_force_channel(str(x)) for x in vals]
+            except Exception:
+                out = []
+        else:
+            out = [_clean_force_channel(x) for x in raw.split(",")]
+    if not out:
+        env_raw = os.environ.get("FORCE_CHANNEL", "") or os.environ.get("FORCE_JOIN_CHANNEL", "")
+        if env_raw:
+            out = [_clean_force_channel(x) for x in env_raw.split(",")]
+    return [c for c in out if c]
+
+
+def set_force_channels(channels: list) -> None:
+    import json as _json
+    cleaned = []
+    for c in channels or []:
+        cc = _clean_force_channel(str(c))
+        if cc and cc not in cleaned:
+            cleaned.append(cc)
+    set_setting("force_channels", _json.dumps(cleaned))
+    set_setting("force_channel", _json.dumps(cleaned))
+
+
+def format_force_channels() -> str:
+    chs = get_force_channels()
+    if not chs:
+        return "সেট করা নেই"
+    return ", ".join(f"@{c}" for c in chs)
+
+
 def ensure_user(user_id: int, username: str = "", first_name: str = "") -> sqlite3.Row:
     is_new = False
     with _db_lock, db() as conn:
@@ -1822,6 +1878,86 @@ def cancel_menu() -> ReplyKeyboardMarkup:
 
 
 # ---------------------------------------------------------------------------
+# Force Channel (Force Join) — multiple channels, admin-set only, never hardcoded
+# ---------------------------------------------------------------------------
+async def _check_force_memberships(context, user_id: int):
+    """Returns (ok, missing, failed). Admins and no-channel setups always pass."""
+    if is_admin(user_id):
+        return True, [], []
+    channels = get_force_channels()
+    if not channels:
+        return True, [], []
+    missing, failed = [], []
+    for ch in channels:
+        try:
+            member = await context.bot.get_chat_member(chat_id=f"@{ch}", user_id=user_id)
+            status = str(getattr(member, "status", "") or "")
+            if status in ("member", "administrator", "creator", "restricted"):
+                continue
+            missing.append(ch)
+        except Exception:
+            failed.append(ch)
+    return (not missing and not failed), missing, failed
+
+
+async def _show_force_join_prompt(update, context, missing, failed, note=""):
+    rows = []
+    for ch in missing:
+        rows.append([InlineKeyboardButton(f"📢 জয়েন করুন: @{ch}", url=f"https://t.me/{ch}")])
+    rows.append([InlineKeyboardButton("✅ আমি জয়েন করেছি", callback_data="force_check")])
+    kb = InlineKeyboardMarkup(rows)
+    lines = ["📢 <b>প্রথমে আমাদের চ্যানেলগুলোতে জয়েন করুন</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+    if note:
+        lines.append(note)
+    if missing:
+        lines.append("👇 নিচের চ্যানেলগুলোতে জয়েন করুন:")
+        for ch in missing:
+            lines.append(f"• @{ch}")
+    if failed:
+        lines.append("")
+        lines.append("⚠️ <b>চেক করা যাচ্ছে না:</b> নিচের চ্যানেলগুলোর সদস্যতা যাচাই করা যাচ্ছে না। অ্যাডমিনকে বটকে ওই চ্যানেলের অ্যাডমিন করতে বলুন:")
+        for ch in failed:
+            lines.append(f"• @{ch}")
+        lines.append("অ্যাডমিন ঠিক করলে আবার ✅ আমি জয়েন করেছি চাপুন। অ্যাডমিনরা এই চেক ছাড়াই ব্যবহার করতে পারবেন।")
+    lines.append("")
+    lines.append("জয়েন করে ✅ আমি জয়েন করেছি বাটনে চাপুন।")
+    text = "\n".join(lines)
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+        except Exception:
+            pass
+        await context.bot.send_message(chat_id=update.effective_user.id, text=text, parse_mode="HTML", reply_markup=kb)
+    elif update.message:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def ensure_force_join(update, context) -> bool:
+    """True if the user may proceed; otherwise shows the join prompt and returns False."""
+    ok, missing, failed = await _check_force_memberships(context, update.effective_user.id)
+    if ok:
+        return True
+    await _show_force_join_prompt(update, context, missing, failed)
+    return False
+
+
+async def handle_force_check_cb(update, context) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    ok, missing, failed = await _check_force_memberships(context, query.from_user.id)
+    if ok:
+        await show_main_dashboard(update, context)
+        return
+    note = ""
+    if missing:
+        note = "❌ এখনো সব চ্যানেলে জয়েন হয়নি।"
+    await _show_force_join_prompt(update, context, missing, failed, note=note)
+
+
+# ---------------------------------------------------------------------------
 # Main Welcome & Dashboard (/start) — No Quick Action Panel
 # ---------------------------------------------------------------------------
 async def show_main_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1891,6 +2027,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                     conn.commit()
 
+    if not await ensure_force_join(update, context):
+        return
     await show_main_dashboard(update, context)
 
 
@@ -4492,6 +4630,78 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
             pass
         return True
 
+    # Admin Force Channel States: add one by one, remove one, list, clear all.
+    if state == ST_SET_FORCE_CHANNEL:
+        raw = text.strip()
+        low = raw.lower()
+        if low in ("clear", "off", "none", "বন্ধ"):
+            set_force_channels([])
+            context.user_data.clear()
+            await update.message.reply_text(
+                "✅ <b>Force Channels সব মুছে দেওয়া হয়েছে।</b> এখন কোনো Force Join চেক হবে না।",
+                parse_mode="HTML",
+                reply_markup=admin_menu(),
+            )
+            return True
+        if low == "list":
+            await update.message.reply_text(
+                f"📋 <b>বর্তমান Force Channels:</b> {format_force_channels()}\n\n"
+                "আরেকটি যোগ করতে চ্যানেল ইউজারনেম লিখুন, মুছতে <code>remove ইউজারনেম</code> লিখুন, সব মুছতে <code>clear</code> লিখুন।",
+                parse_mode="HTML",
+                reply_markup=cancel_menu(),
+            )
+            return True
+        if low.startswith("remove "):
+            target = _clean_force_channel(raw[7:])
+            if not target:
+                await update.message.reply_text(
+                    "❌ সঠিক চ্যানেল ইউজারনেম লিখুন (যেমন: <code>remove ইউজারনেম</code>):",
+                    parse_mode="HTML",
+                    reply_markup=cancel_menu(),
+                )
+                return True
+            chs = get_force_channels()
+            if target in chs:
+                chs.remove(target)
+                set_force_channels(chs)
+                await update.message.reply_text(
+                    f"✅ <b>@{target}</b> Force Channel থেকে মুছে দেওয়া হয়েছে।\n📋 বর্তমান: {format_force_channels()}",
+                    parse_mode="HTML",
+                    reply_markup=cancel_menu(),
+                )
+            else:
+                await update.message.reply_text(
+                    f"⚠️ <b>@{target}</b> Force Channels-এ নেই।\n📋 বর্তমান: {format_force_channels()}",
+                    parse_mode="HTML",
+                    reply_markup=cancel_menu(),
+                )
+            return True
+        cleaned = _clean_force_channel(raw)
+        if not cleaned:
+            await update.message.reply_text(
+                "❌ সঠিক চ্যানেল ইউজারনেম লিখুন (@ ছাড়া, শুধু অক্ষর/সংখ্যা/_):",
+                parse_mode="HTML",
+                reply_markup=cancel_menu(),
+            )
+            return True
+        chs = get_force_channels()
+        if cleaned in chs:
+            await update.message.reply_text(
+                f"⚠️ <b>@{cleaned}</b> ইতিমধ্যেই Force Channels-এ আছে।\n📋 বর্তমান: {format_force_channels()}",
+                parse_mode="HTML",
+                reply_markup=cancel_menu(),
+            )
+            return True
+        chs.append(cleaned)
+        set_force_channels(chs)
+        await update.message.reply_text(
+            f"✅ <b>@{cleaned}</b> Force Channel-এ যোগ করা হয়েছে।\n📋 বর্তমান: {format_force_channels()}\n\n"
+            "আরেকটি যোগ করতে আরেকটি ইউজারনেম লিখুন, অথবা 🔙 মেইন মেনু চাপুন।",
+            parse_mode="HTML",
+            reply_markup=cancel_menu(),
+        )
+        return True
+
     # Admin Settings States
     if state in (
         ST_SET_BKASH,
@@ -4586,7 +4796,30 @@ async def handle_admin_settings_cb(update: Update, context: ContextTypes.DEFAULT
                 parse_mode="HTML",
             )
         return
+    if data == "adm_force_list":
+        await query.edit_message_text(
+            f"📋 <b>বর্তমান Force Channels:</b> {format_force_channels()}\n\n"
+            "যোগ/মুছতে বোনাস ও সাপোর্ট সেটিংস থেকে 📢 Force Channel Set চাপুন।",
+            parse_mode="HTML",
+        )
+        return
+    if data == "adm_force_clear":
+        set_force_channels([])
+        await query.edit_message_text(
+            "✅ <b>Force Channels সব মুছে দেওয়া হয়েছে।</b> এখন কোনো Force Join চেক হবে না।",
+            parse_mode="HTML",
+        )
+        return
     prompts = {
+        "adm_set_force": (
+            ST_SET_FORCE_CHANNEL,
+            "📢 <b>Force Channel সেট করুন</b>\n\n"
+            f"📋 বর্তমান: {format_force_channels()}\n\n"
+            "একটি করে যোগ করতে চ্যানেল ইউজারনেম লিখে পাঠান (@ ছাড়া)।\n"
+            "মুছতে: <code>remove ইউজারনেম</code> লিখুন।\n"
+            "সব মুছতে: <code>clear</code> লিখুন।\n"
+            "তালিকা দেখতে: <code>list</code> লিখুন।",
+        ),
         "adm_set_bkash": (ST_SET_BKASH, "🌸 নতুন <b>bKash Number</b> লিখে পাঠান:"),
         "adm_set_nagad": (ST_SET_NAGAD, "🧡 নতুন <b>Nagad Number</b> লিখে পাঠান:"),
         "adm_set_rocket": (ST_SET_ROCKET, "💜 নতুন <b>Rocket Number</b> লিখে পাঠান:"),
@@ -4877,26 +5110,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if text in (BTN_NEW_ORDER, "🚀 নতুন অর্ডার (SMM)", "নতুন অর্ডার"):
+        if not await ensure_force_join(update, context):
+            return
         await show_categories(update, context)
         return
 
     if text in (BTN_SERVICES, "সার্ভিস লিস্ট"):
+        if not await ensure_force_join(update, context):
+            return
         await show_all_services_list(update, context)
         return
 
     if text in (BTN_MY_ORDERS, "আমার অর্ডার"):
+        if not await ensure_force_join(update, context):
+            return
         await show_my_orders(update, context)
         return
 
     if text in (BTN_DEPOSIT, "ডিপোজিট"):
+        if not await ensure_force_join(update, context):
+            return
         await start_deposit_flow(update, context)
         return
 
     if text in (BTN_PROFILE, "প্রোফাইল"):
+        if not await ensure_force_join(update, context):
+            return
         await show_profile(update, context)
         return
 
     if text in (BTN_REFER, "রেফারেল"):
+        if not await ensure_force_join(update, context):
+            return
         await show_referral(update, context)
         return
 
@@ -5071,13 +5316,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             "🎁 Refer Bonus সেট", callback_data="adm_set_refer"
                         )
                     ],
+                    [
+                        InlineKeyboardButton(
+                            "📢 Force Channel Set", callback_data="adm_set_force"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📋 Force Channels List", callback_data="adm_force_list"
+                        ),
+                        InlineKeyboardButton(
+                            "🗑️ Clear All Force Channels", callback_data="adm_force_clear"
+                        ),
+                    ],
                 ]
             )
             await update.message.reply_text(
                 "🎁 <b>বোনাস ও সাপোর্ট সেটিংস:</b>\n"
                 f"├─ Support: @{get_setting('support_username', 'Not Set')}\n"
                 f"├─ Daily Bonus: ৳{get_setting('daily_bonus', '1')}\n"
-                f"└─ Refer Bonus: {get_refer_bonus_pct():g}%",
+                f"├─ Refer Bonus: {get_refer_bonus_pct():g}%\n"
+                f"└─ Force Channels: {format_force_channels()}",
                 parse_mode="HTML",
                 reply_markup=kb,
             )
@@ -5278,8 +5537,9 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(handle_edit_service_cb, pattern="^edit_[0-9]+$")
     )
+    application.add_handler(CallbackQueryHandler(handle_force_check_cb, pattern="^force_check$"))
     application.add_handler(
-        CallbackQueryHandler(handle_admin_settings_cb, pattern="^adm_(set|toggle)_")
+        CallbackQueryHandler(handle_admin_settings_cb, pattern="^adm_(set|toggle|force)_")
     )
 
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
