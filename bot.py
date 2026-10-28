@@ -1336,7 +1336,6 @@ def build_single_column_service_buttons(
         rows.append(
             [InlineKeyboardButton("🔙 প্ল্যাটফর্ম তালিকায় ফিরুন", callback_data="open_cats")]
         )
-    rows.append([InlineKeyboardButton("🔙 মেইন মেনু", callback_data="menu_main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1878,94 +1877,27 @@ def cancel_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([[_mkb(BTN_CANCEL, "danger")]], resize_keyboard=True)
 
 
-# ---------------------------------------------------------------------------
-# Persistent inline main menu (backup for Telegram Desktop, where the reply
-# keyboard is hidden behind the keyboard icon and edited messages lose it).
-# The reply keyboard is KEPT - this inline menu is only a backup, so phone
-# users are unaffected. Tapping an inline button calls the same handler as
-# the matching reply-keyboard button.
-# ---------------------------------------------------------------------------
-def inline_main_menu(user_id: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("🚀 নতুন অর্ডার", callback_data="menu_new_order"),
-         InlineKeyboardButton("📋 সার্ভিস লিস্ট", callback_data="menu_services")],
-        [InlineKeyboardButton("💰 ডিপোজিট", callback_data="menu_deposit"),
-         InlineKeyboardButton("📦 আমার অর্ডার", callback_data="menu_orders")],
-        [InlineKeyboardButton("👤 প্রোফাইল", callback_data="menu_profile"),
-         InlineKeyboardButton("👥 রেফারেল", callback_data="menu_refer")],
-        [InlineKeyboardButton("🆘 সাপোর্ট", callback_data="menu_support"),
-         InlineKeyboardButton("🏆 লিডারবোর্ড", callback_data="menu_leaderboard")],
-        [InlineKeyboardButton("🔙 মেইন মেনু", callback_data="menu_main")],
-    ]
-    if is_admin(user_id):
-        rows.append([InlineKeyboardButton("📊 অ্যাডমিন প্যানেল", callback_data="menu_admin")])
-    return InlineKeyboardMarkup(rows)
+async def _restore_user_menu(context, user_id: int) -> None:
+    """Re-send the reply keyboard after a terminal callback edit.
+
+    A callback edit cannot carry a reply keyboard (Bot API editMessageText
+    accepts only an inline keyboard), so the menu is restored with a fresh
+    message carrying main_menu -- the same pattern already used for deposit
+    cancel/submit. Reply keyboard only.
+    """
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="👇 আপনার মেইন মেনু:",
+        reply_markup=main_menu(user_id),
+    )
 
 
-async def send_inline_main_menu(update, context) -> None:
-    """Sends a small backup message carrying the inline main menu."""
-    uid = update.effective_user.id
-    text = "🧭 <b>মেইন মেনু</b>\nনিচের বাটন না দেখলে এখান থেকে চাপুন — মেনু হারিয়ে গেলে /menu লিখুন।"
-    if update.message:
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=inline_main_menu(uid))
-    elif update.callback_query:
-        await context.bot.send_message(chat_id=uid, text=text, parse_mode="HTML", reply_markup=inline_main_menu(uid))
-
-
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ /menu - always restores the main menu, even if the user is stuck."""
-    context.user_data.clear()
-    if not await ensure_force_join(update, context):
-        return
-    await show_main_dashboard(update, context)
-
-
-async def handle_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Inline main-menu buttons -> same handlers as the reply-keyboard buttons."""
-    query = update.callback_query
-    if query is None:
-        return
-    await query.answer()
-    data = query.data or ""
-    context.user_data.clear()
-    if data == "menu_main":
-        if not await ensure_force_join(update, context):
-            return
-        await show_main_dashboard(update, context)
-        return
-    if data == "menu_new_order":
-        if not await ensure_force_join(update, context):
-            return
-        await show_categories(update, context)
-        return
-    if data == "menu_services":
-        if not await ensure_force_join(update, context):
-            return
-        await show_all_services_list(update, context)
-        return
-    if data == "menu_deposit":
-        if not await ensure_force_join(update, context):
-            return
-        await start_deposit_flow(update, context)
-        return
-    if data == "menu_orders":
-        await show_my_orders(update, context)
-        return
-    if data == "menu_profile":
-        await show_profile(update, context)
-        return
-    if data == "menu_refer":
-        await show_referral(update, context)
-        return
-    if data == "menu_support":
-        await show_support(update, context)
-        return
-    if data == "menu_leaderboard":
-        await show_leaderboard(update, context)
-        return
-    if data == "menu_admin":
-        await show_admin_panel(update, context)
-        return
+async def _restore_admin_menu(context, user_id: int) -> None:
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="👇 অ্যাডমিন মেনু:",
+        reply_markup=admin_menu(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2074,22 +2006,26 @@ async def show_main_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE
         "🔥 <b>অ্যাক্টিভ প্ল্যাটফর্মসমূহ (⏱️ Average time: 2-6 hours):</b>\n"
         "📸 <b>Instagram</b> • 🎵 <b>TikTok</b> • 📘 <b>Facebook</b> • ▶️ <b>YouTube</b>\n"
         "─────────\n"
-        "👇 শুরু করতে নিচের মেনু থেকে বাটন সিলেক্ট করুন:\n"
-        "মেনু না দেখলে /menu লিখুন — বাটন ফিরে আসবে।"
+        "👇 শুরু করতে নিচের মেনু থেকে বাটন সিলেক্ট করুন:"
     )
 
     if update.message:
         await update.message.reply_text(
             text, parse_mode="HTML", reply_markup=main_menu(user.id)
         )
-        # Inline backup: on Telegram Desktop the reply keyboard is hidden
-        # behind the keyboard icon, so the welcome message alone looked
-        # button-less. This message always shows clickable buttons.
-        await send_inline_main_menu(update, context)
     elif update.callback_query:
+        # Callback edits cannot carry a reply keyboard (Bot API editMessageText
+        # accepts only an inline keyboard). Send the dashboard as a fresh
+        # message with the reply keyboard instead of editing it away -- this
+        # is the dashboard itself, not a second backup message, and it uses
+        # the reply keyboard only.
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            text, parse_mode="HTML", reply_markup=inline_main_menu(user.id)
+        try:
+            await update.callback_query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=user.id, text=text, parse_mode="HTML", reply_markup=main_menu(user.id)
         )
 
 
@@ -2136,7 +2072,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_categories_keyboard() -> InlineKeyboardMarkup:
     cats = list_categories(include_disabled=False)
     rows = [[InlineKeyboardButton(c, callback_data=f"cat_{idx}")] for idx, c in enumerate(cats)]
-    rows.append([InlineKeyboardButton("🔙 মেইন মেনু", callback_data="menu_main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2148,6 +2083,7 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(msg, reply_markup=main_menu(update.effective_user.id))
         elif update.callback_query:
             await update.callback_query.edit_message_text(msg)
+            await _restore_user_menu(context, update.effective_user.id)
         return
 
     text = (
@@ -2177,7 +2113,7 @@ async def show_all_services_list(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.effective_user.id
     services = list_services(include_disabled=False)
     if not services:
-        await update.effective_message.reply_text(
+        await update.message.reply_text(
             "কোনো সার্ভিস নেই।", reply_markup=main_menu(user_id)
         )
         return
@@ -2205,7 +2141,7 @@ async def show_all_services_list(update: Update, context: ContextTypes.DEFAULT_T
     sections.append("━━━━━━━━━━━━━━━━━━━━━━\n👇 অর্ডার করতে নিচের সার্ভিস বাটনে চাপুন:")
     text = "\n".join(sections)
     kb = build_single_column_service_buttons(services, include_back_to_cats=False)
-    await update.effective_message.reply_text(
+    await update.message.reply_text(
         text,
         parse_mode="HTML",
         reply_markup=kb,
@@ -2315,7 +2251,8 @@ async def handle_category_And_service_cb(
             return
         s = get_service(sid)
         if not s or int(s["is_active"] or 0) == 0:
-            await query.edit_message_text("⚠️ সার্ভিসটি বর্তমানে চালু নেই।", reply_markup=inline_main_menu(query.from_user.id))
+            await query.edit_message_text("⚠️ সার্ভিসটি বর্তমানে চালু নেই।")
+            await _restore_user_menu(context, query.from_user.id)
             return
 
         pid = int(s["panel_service_id"] or 0)
@@ -2381,15 +2318,15 @@ async def handle_category_And_service_cb(
     # Step 5, 6, 7: Order Confirm / Cancel Callback
     if data == "order_cancel_cb":
         context.user_data.clear()
-        await query.edit_message_text("❌ অর্ডারটি বাতিল করা হয়েছে। আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি।", reply_markup=inline_main_menu(query.from_user.id))
+        await query.edit_message_text("❌ অর্ডারটি বাতিল করা হয়েছে। আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি।")
+        await _restore_user_menu(context, query.from_user.id)
         return
 
     if data == "order_confirm_cb":
         user = query.from_user
         if context.user_data.get("state") != ST_ORDER_CONFIRM:
-            await query.edit_message_text("⚠️ অর্ডার সেশনটির মেয়াদ শেষ হয়েছে। অনুগ্রহ করে নতুন করে অর্ডার করুন।",
-            reply_markup=inline_main_menu(user.id),
-        )
+            await query.edit_message_text("⚠️ অর্ডার সেশনটির মেয়াদ শেষ হয়েছে। অনুগ্রহ করে নতুন করে অর্ডার করুন।")
+            await _restore_user_menu(context, query.from_user.id)
             return
 
         sid = int(context.user_data.get("order_service_id", 0))
@@ -2399,16 +2336,14 @@ async def handle_category_And_service_cb(
 
         s = get_service(sid)
         if not s or int(s["is_active"] or 0) == 0:
-            await query.edit_message_text("⚠️ সার্ভিসটি পাওয়া যায়নি। কোনো টাকা কাটা হয়নি।",
-            reply_markup=inline_main_menu(user.id),
-        )
+            await query.edit_message_text("⚠️ সার্ভিসটি পাওয়া যায়নি। কোনো টাকা কাটা হয়নি।")
+            await _restore_user_menu(context, query.from_user.id)
             return
 
         pid = int(s["panel_service_id"] or 0)
         if pid <= 0:
-            await query.edit_message_text("⚠️ সার্ভিসটি প্যানেলের সাথে যুক্ত নয়। কোনো টাকা কাটা হয়নি।",
-            reply_markup=inline_main_menu(user.id),
-        )
+            await query.edit_message_text("⚠️ সার্ভিসটি প্যানেলের সাথে যুক্ত নয়। কোনো টাকা কাটা হয়নি।")
+            await _restore_user_menu(context, query.from_user.id)
             return
 
         # Check API env vars first
@@ -2417,8 +2352,8 @@ async def handle_category_And_service_cb(
             await query.edit_message_text(
                 "⚠️ <b>Panel API not set - contact admin</b>\nআপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি।",
                 parse_mode="HTML",
-            reply_markup=inline_main_menu(user.id),
-        )
+            )
+            await _restore_user_menu(context, query.from_user.id)
             return
 
         original_price, disc_pct, sell_price = calc_vip_order_price(s, qty, user.id)
@@ -2451,8 +2386,8 @@ async def handle_category_And_service_cb(
                 f"⚠️ <b>প্যানেল ব্যালেন্স যাচাই করা যায়নি:</b> {pbal_res.get('error')}\n"
                 "আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি।",
                 parse_mode="HTML",
-            reply_markup=inline_main_menu(user.id),
-        )
+            )
+            await _restore_user_menu(context, query.from_user.id)
             return
 
         if float(pbal_res.get("balance", 0.0)) < panel_cost or (
@@ -2462,14 +2397,12 @@ async def handle_category_And_service_cb(
                 "⚠️ <b>সার্ভার প্যানেলে পর্যাপ্ত ব্যালেন্স নেই। অ্যাডমিনের সাথে যোগাযোগ করুন।</b>\n"
                 "আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি।",
                 parse_mode="HTML",
-            reply_markup=inline_main_menu(user.id),
-        )
+            )
+            await _restore_user_menu(context, query.from_user.id)
             return
 
         # Step 6: Call panel_add_order()
-        await query.edit_message_text("⏳ প্যানেলে অর্ডার পাঠানো হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...",
-            reply_markup=inline_main_menu(user.id),
-        )
+        await query.edit_message_text("⏳ প্যানেলে অর্ডার পাঠানো হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...")
         add_res = panel_add_order(pid, link, qty)
         if not add_res.get("ok"):
             err_msg = add_res.get("error", "Unknown panel error")
@@ -2477,8 +2410,8 @@ async def handle_category_And_service_cb(
                 f"❌ <b>প্যানেল অর্ডার গ্রহণ করেনি:</b>\n<code>{err_msg}</code>\n\n"
                 "💳 আপনার ওয়ালেট থেকে কোনো টাকা কাটা হয়নি।",
                 parse_mode="HTML",
-            reply_markup=inline_main_menu(user.id),
-        )
+            )
+            await _restore_user_menu(context, query.from_user.id)
             return
 
         panel_oid = int(add_res["order"])
@@ -2532,7 +2465,6 @@ async def handle_category_And_service_cb(
             "─────────\n"
             "📦 <b>আমার অর্ডার</b> মেনু থেকে যেকোনো সময় লাইভ স্ট্যাটাস চেক করতে পারবেন।",
             parse_mode="HTML",
-            reply_markup=inline_main_menu(user.id),
         )
         await notify_admin_new_order(
             context,
@@ -2546,6 +2478,7 @@ async def handle_category_And_service_cb(
             panel_service_id=pid,
             panel_cost=panel_cost,
         )
+        await _restore_user_menu(context, query.from_user.id)
         return
 
 
@@ -2821,12 +2754,15 @@ async def handle_user_order_actions_cb(
             ).fetchone()
         if not order:
             await query.edit_message_text("⚠️ অর্ডারটি পাওয়া যায়নি।")
+            await _restore_user_menu(context, query.from_user.id)
             return
 
         ok, summary, updated = await sync_order_with_panel(oid, context)
         svc = get_service(updated["service_id"]) if updated else None
         kb = build_user_order_keyboard(updated, svc) if updated else None
         await query.edit_message_text(summary, parse_mode="HTML", reply_markup=kb)
+        if kb is None:
+            await _restore_user_menu(context, query.from_user.id)
         return
 
     if data.startswith("usr_drop_"):
@@ -2840,13 +2776,16 @@ async def handle_user_order_actions_cb(
             ).fetchone()
         if not order:
             await query.edit_message_text("⚠️ অর্ডারটি পাওয়া যায়নি।")
+            await _restore_user_menu(context, query.from_user.id)
             return
         svc = get_service(order["service_id"])
         if not svc or int(svc["refill_enabled"] or 0) != 1:
             await query.edit_message_text("⚠️ এই সার্ভিসটিতে রিফিল সুবিধা নেই (No Refill)।")
+            await _restore_user_menu(context, query.from_user.id)
             return
         if str(order["status"] or "").strip().lower() != "completed":
             await query.edit_message_text("⚠️ শুধুমাত্র Completed অর্ডারে ড্রপ হলে রিফিল করা যাবে।")
+            await _restore_user_menu(context, query.from_user.id)
             return
 
         kb = InlineKeyboardMarkup(
@@ -2884,13 +2823,16 @@ async def handle_user_order_actions_cb(
             ).fetchone()
         if not order:
             await query.edit_message_text("⚠️ অর্ডারটি পাওয়া যায়নি।")
+            await _restore_user_menu(context, query.from_user.id)
             return
         svc = get_service(order["service_id"])
         if not svc or int(svc["refill_enabled"] or 0) != 1:
             await query.edit_message_text("⚠️ এই সার্ভিসটিতে রিফিল সুবিধা নেই (No Refill)।")
+            await _restore_user_menu(context, query.from_user.id)
             return
         if str(order["status"] or "").strip().lower() != "completed":
             await query.edit_message_text("⚠️ শুধুমাত্র Completed অর্ডারে রিফিল করা যাবে।")
+            await _restore_user_menu(context, query.from_user.id)
             return
 
         ref_res = panel_refill(int(order["panel_order_id"]))
@@ -2901,11 +2843,13 @@ async def handle_user_order_actions_cb(
                 f"🆔 Refill ID: <code>{ref_res.get('refill')}</code>",
                 parse_mode="HTML",
             )
+            await _restore_user_menu(context, query.from_user.id)
         else:
             await query.edit_message_text(
                 f"❌ <b>প্যানেল রিফিল গ্রহণ করেনি:</b>\n<code>{ref_res.get('error')}</code>",
                 parse_mode="HTML",
             )
+        await _restore_user_menu(context, query.from_user.id)
         return
 
 
@@ -3048,14 +2992,16 @@ async def handle_deposit_method_cb(
 
     if data == "dep_submit_cb":
         if context.user_data.get("state") != ST_DEP_SUBMIT:
-            await query.edit_message_text("⚠️ ডিপোজিট সেশনটির মেয়াদ শেষ হয়েছে। অনুগ্রহ করে আবার 💰 ডিপোজিট বাটনে চাপুন।", reply_markup=inline_main_menu(query.from_user.id))
+            await query.edit_message_text("⚠️ ডিপোজিট সেশনটির মেয়াদ শেষ হয়েছে। অনুগ্রহ করে আবার 💰 ডিপোজিট বাটনে চাপুন।")
+            await _restore_user_menu(context, query.from_user.id)
             return
         method = str(context.user_data.get("dep_method", "bKash Personal (Send Money)"))
         amt = float(context.user_data.get("dep_amount", 0.0))
         trxid = str(context.user_data.get("dep_trxid", "")).strip()
         context.user_data.clear()
         if amt <= 0 or not trxid:
-            await query.edit_message_text("⚠️ ডিপোজিট তথ্য অসম্পূর্ণ। আবার চেষ্টা করুন।", reply_markup=inline_main_menu(query.from_user.id))
+            await query.edit_message_text("⚠️ ডিপোজিট তথ্য অসম্পূর্ণ। আবার চেষ্টা করুন।")
+            await _restore_user_menu(context, query.from_user.id)
             return
         if is_trxid_used(trxid):
             await query.edit_message_text(
@@ -3083,6 +3029,7 @@ async def handle_deposit_method_cb(
         method_key = data[len("dep_m_"):]
         if method_key not in DEPOSIT_METHODS or not deposit_method_enabled(method_key):
             await query.edit_message_text("❌ এই মেথডটি বর্তমানে বন্ধ আছে। অন্য মেথড বাছুন।")
+            await _restore_user_menu(context, query.from_user.id)
             return
         if not deposit_method_number(method_key):
             _kb2 = InlineKeyboardMarkup(
@@ -3118,6 +3065,7 @@ async def handle_deposit_method_cb(
         return
 
     await query.edit_message_text("⚠️ ডিপোজিট সেশনটির মেয়াদ শেষ হয়েছে। অনুগ্রহ করে আবার 💰 ডিপোজিট বাটনে চাপুন.")
+    await _restore_user_menu(context, query.from_user.id)
 
 
 # ---------------------------------------------------------------------------
@@ -3167,6 +3115,7 @@ async def handle_admin_decisions_cb(
     await query.answer()
     if not is_admin(query.from_user.id):
         await query.edit_message_text("⛔ শুধুমাত্র অ্যাডমিন এই অ্যাকশন নিতে পারবে।")
+        await _restore_user_menu(context, query.from_user.id)
         return
 
     data = query.data or ""
@@ -3194,6 +3143,7 @@ async def handle_admin_decisions_cb(
             await query.edit_message_text(summary, parse_mode="HTML", reply_markup=kb)
         else:
             await query.edit_message_text(summary, parse_mode="HTML")
+            await _restore_admin_menu(context, query.from_user.id)
         return
 
     # Admin: Refund Order button (refunds sell price to user wallet and marks order Cancelled)
@@ -3206,11 +3156,13 @@ async def handle_admin_decisions_cb(
             order = conn.execute("SELECT * FROM orders WHERE id = ?", (oid,)).fetchone()
             if not order:
                 await query.edit_message_text("⚠️ অর্ডার পাওয়া যায়নি।")
+                await _restore_admin_menu(context, query.from_user.id)
                 return
             if int(order["refunded"] or 0) == 1 or str(order["status"]).lower() == "cancelled":
                 await query.edit_message_text(
                     f"ℹ️ Order #SMM-{oid} ইতিমধ্যে Cancelled / Refunded করা হয়েছে।"
                 )
+                await _restore_admin_menu(context, query.from_user.id)
                 return
             conn.execute(
                 "UPDATE orders SET status = 'Cancelled', refunded = 1 WHERE id = ?",
@@ -3228,6 +3180,7 @@ async def handle_admin_decisions_cb(
             f"💰 <b>৳{refund:.2f}</b> ক্রেতার ওয়ালেটে ফেরত দেওয়া হয়েছে (নতুন ব্যালেন্স: ৳{new_bal:.2f})।",
             parse_mode="HTML",
         )
+        await _restore_admin_menu(context, query.from_user.id)
         try:
             await context.bot.send_message(
                 chat_id=order["buyer_id"],
@@ -3258,9 +3211,11 @@ async def handle_admin_decisions_cb(
             ).fetchone()
             if not row:
                 await query.edit_message_text("⚠️ ডিপোজিট রিকোয়েস্ট পাওয়া যায়নি।")
+                await _restore_admin_menu(context, query.from_user.id)
                 return
             if row["status"] != "pending":
                 await query.edit_message_text(f"ℹ️ এই রিকোয়েস্ট ইতিমধ্যে {row['status']}।")
+                await _restore_admin_menu(context, query.from_user.id)
                 return
             new_st = "approved" if is_app else "rejected"
             conn.execute(
@@ -3281,6 +3236,7 @@ async def handle_admin_decisions_cb(
                 f"💰 যোগ হয়েছে: ৳{row['amount']:.2f} | নতুন ব্যালেন্স: ৳{new_bal:.2f}",
                 parse_mode="HTML",
             )
+            await _restore_admin_menu(context, query.from_user.id)
             try:
                 await context.bot.send_message(
                     chat_id=row["buyer_id"],
@@ -3301,6 +3257,7 @@ async def handle_admin_decisions_cb(
                 f"❌ <b>Deposit #{req_id} Rejected!</b> (User: {row['buyer_id']})",
                 parse_mode="HTML",
             )
+            await _restore_admin_menu(context, query.from_user.id)
             try:
                 await context.bot.send_message(
                     chat_id=row["buyer_id"],
@@ -3331,11 +3288,13 @@ async def handle_admin_decisions_cb(
             order = conn.execute("SELECT * FROM orders WHERE id = ?", (oid,)).fetchone()
             if not order:
                 await query.edit_message_text("⚠️ অর্ডার পাওয়া যায়নি।")
+                await _restore_admin_menu(context, query.from_user.id)
                 return
             if str(order["status"]).lower() in ("completed", "cancelled"):
                 await query.edit_message_text(
                     f"ℹ️ Order #SMM-{oid} ইতিমধ্যে {order['status']} করা হয়েছে।"
                 )
+                await _restore_admin_menu(context, query.from_user.id)
                 return
 
             if action == "proc":
@@ -3377,6 +3336,7 @@ async def handle_admin_decisions_cb(
                 f"✅ <b>Order #SMM-{oid} (Panel #{order['panel_order_id']}) সফলভাবে Completed করা হয়েছে!</b>",
                 parse_mode="HTML",
             )
+            await _restore_admin_menu(context, query.from_user.id)
             try:
                 await context.bot.send_message(
                     chat_id=order["buyer_id"],
@@ -3411,6 +3371,7 @@ async def handle_admin_decisions_cb(
                 f"❌ <b>Order #SMM-{oid} (Panel #{order['panel_order_id']}) বাতিল করা হয়েছে এবং ৳{refund:.2f} ক্রেতার ওয়ালেটে রিফান্ড দেওয়া হয়েছে।</b>",
                 parse_mode="HTML",
             )
+            await _restore_admin_menu(context, query.from_user.id)
             try:
                 await context.bot.send_message(
                     chat_id=order["buyer_id"],
@@ -3444,6 +3405,7 @@ async def handle_delete_service_cb(
         conn.execute("DELETE FROM services WHERE id = ?", (sid,))
         conn.commit()
     await query.edit_message_text(f"🗑️ সার্ভিস #{sid} সফলভাবে ডিলিট করা হয়েছে।")
+    await _restore_admin_menu(context, query.from_user.id)
 
 
 async def handle_edit_service_cb(
@@ -3460,6 +3422,7 @@ async def handle_edit_service_cb(
     s = get_service(sid)
     if not s:
         await query.edit_message_text("⚠️ সার্ভিসটি পাওয়া যায়নি।")
+        await _restore_admin_menu(context, query.from_user.id)
         return
 
     context.user_data.clear()
@@ -3497,7 +3460,7 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             (uid,),
         ).fetchall()
     if not rows:
-        await update.effective_message.reply_text(
+        await update.message.reply_text(
             "📦 <b>আপনার এখনো কোনো অর্ডার নেই।</b>\n\n"
             "অর্ডার করতে <b>🚀 নতুন অর্ডার</b> বাটনে ক্লিক করুন!",
             parse_mode="HTML",
@@ -3514,7 +3477,7 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "cancelled": "❌ Cancelled (Refunded)",
         "rejected": "❌ Rejected",
     }
-    await update.effective_message.reply_text(
+    await update.message.reply_text(
         "📦 <b>আপনার সর্বশেষ অর্ডারসমূহ (লাইভ স্ট্যাটাস ও রিফিল প্যানেল):</b>",
         parse_mode="HTML",
         reply_markup=main_menu(uid),
@@ -3540,7 +3503,7 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"🔗 <code>{r['target_link']}</code>"
         )
         kb = build_user_order_keyboard(r, svc)
-        await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3572,11 +3535,9 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "📊 <b>অর্ডার সামারি:</b>\n"
         f"📦 <b>মোট অর্ডার:</b> {total_orders} টি | ✅ <b>সম্পন্ন:</b> {comp_orders} টি"
     )
-    await update.effective_message.reply_text(
+    await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=main_menu(user.id)
     )
-    if update.message:
-        await send_inline_main_menu(update, context)
 
 
 async def show_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3597,13 +3558,9 @@ async def show_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "─────────\n"
         f"👥 <b>মোট রেফার:</b> {u['refer_count']} জন | 💰 <b>মোট আয়:</b> ৳{u['refer_earned']:.2f}"
     )
-    await update.effective_message.reply_text(
+    await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=main_menu(user.id)
     )
-    if update.message:
-        # Referral was a reported dead end: the inline backup guarantees a
-        # visible way back even if the reply keyboard is hidden on Desktop.
-        await send_inline_main_menu(update, context)
 
 
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3664,7 +3621,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     else:
         lines.append("👤 <b>আপনার র‍্যাংক:</b> এখনো র‍্যাংকিংয়ে নেই (Completed অর্ডার ০টি)")
-    await update.effective_message.reply_text(
+    await update.message.reply_text(
         "\n".join(lines),
         parse_mode="HTML",
         reply_markup=main_menu(uid),
@@ -3720,10 +3677,8 @@ async def handle_claim_daily_cb(update: Update, context: ContextTypes.DEFAULT_TY
 
     now_ts = int(time.time())
     if daily_amt <= 0 or (now_ts - int(u["last_daily_ts"] or 0) < 86400):
-        await query.edit_message_text(
-        "⏳ আপনি ইতিমধ্যে আজকের ডেইলি বোনাস ক্লেইম করেছেন!",
-        reply_markup=inline_main_menu(user.id),
-    )
+        await query.edit_message_text("⏳ আপনি ইতিমধ্যে আজকের ডেইলি বোনাস ক্লেইম করেছেন!")
+        await _restore_user_menu(context, query.from_user.id)
         return
 
     with _db_lock, db() as conn:
@@ -3743,8 +3698,8 @@ async def handle_claim_daily_cb(update: Update, context: ContextTypes.DEFAULT_TY
         f"🎉 <b>অভিনন্দন! আপনি ৳{daily_amt:.2f} ডেইলি বোনাস পেয়েছেন!</b>\n"
         f"💳 আপনার বর্তমান ব্যালেন্স: <b>৳{new_bal:.2f}</b>",
         parse_mode="HTML",
-        reply_markup=inline_main_menu(user.id),
     )
+    await _restore_user_menu(context, query.from_user.id)
 
 
 async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3758,7 +3713,7 @@ async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"{sup_line}"
         "💬 আপনার যেকোনো সমস্যা, অর্ডার আইডি বা প্রশ্ন নিচের মেসেজ বক্সে লিখে পাঠান। আমাদের অ্যাডমিন টিম সরাসরি আপনার মেসেজ দেখতে পাবে:"
     )
-    await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=cancel_menu())
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=cancel_menu())
 
 
 # ---------------------------------------------------------------------------
@@ -3799,7 +3754,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "👇 কন্ট্রোল করতে নিচের বাটন বেছে নিন:"
     )
-    await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=admin_menu())
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=admin_menu())
 
 
 def _fetch_all_users_with_orders() -> list[sqlite3.Row]:
@@ -4067,7 +4022,6 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
             else main_menu(user.id)
         )
         await update.message.reply_text("❌ বাতিল করা হয়েছে।", reply_markup=markup)
-        await send_inline_main_menu(update, context)
         return True
 
     # Deposit method selection (Paid File style, Step 1): user must tap a method button, not type.
@@ -5007,7 +4961,8 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
                 conn.commit()
             await update.message.reply_text(
-                f"✅ Mini App থেকে সার্ভিস অ্যাড হয়েছে: {pname} — ৳{_fmt_num(pprice)}/1000 (Panel ID #{pid})"
+                f"✅ Mini App থেকে সার্ভিস অ্যাড হয়েছে: {pname} — ৳{_fmt_num(pprice)}/1000 (Panel ID #{pid})",
+                reply_markup=main_menu(user.id),
             )
         return
 
@@ -5033,7 +4988,8 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
             conn.commit()
         await update.message.reply_text(
             f"✅ Mini App ডিপোজিট রিকোয়েস্ট (#DEP-{req_id}) জমা হয়েছে!\n"
-            f"🏦 মেথড: {method} | 💰 ৳{amount:.2f} | TrxID: {trxid}"
+            f"🏦 মেথড: {method} | 💰 ৳{amount:.2f} | TrxID: {trxid}",
+            reply_markup=main_menu(user.id),
         )
         aid = _admin_id()
         if aid:
@@ -5077,25 +5033,27 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not s or int(s["panel_service_id"] or 0) <= 0:
         await update.message.reply_text(
-            "⚠️ এই সার্ভিসটি বর্তমানে অর্ডারের জন্য উপলব্ধ নয়।"
+            "⚠️ এই সার্ভিসটি বর্তমানে অর্ডারের জন্য উপলব্ধ নয়।",
+            reply_markup=main_menu(user.id),
         )
         return
 
     api_url, api_key = _get_smm_api_config()
     if not api_url or not api_key:
-        await update.message.reply_text("⚠️ Panel API not set - contact admin")
+        await update.message.reply_text("⚠️ Panel API not set - contact admin", reply_markup=main_menu(user.id))
         return
 
     valid_link, link_err = validate_service_link(s["category"], s["name"], link)
     if not valid_link:
-        await update.message.reply_text(link_err, parse_mode="HTML")
+        await update.message.reply_text(link_err, parse_mode="HTML", reply_markup=main_menu(user.id))
         return
 
     min_q = int(s["min_qty"] or 0)
     max_q = int(s["max_qty"] or 0)
     if qty <= 0 or (min_q > 0 and qty < min_q) or (max_q > 0 and qty > max_q):
         await update.message.reply_text(
-            f"⚠️ পরিমাণ সঠিক নয় ({format_min_max(s)})!"
+            f"⚠️ পরিমাণ সঠিক নয় ({format_min_max(s)})!",
+            reply_markup=main_menu(user.id),
         )
         return
 
@@ -5104,14 +5062,16 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     bal = get_balance(user.id)
     if bal < sell_price:
         await update.message.reply_text(
-            f"⚠️ ব্যালেন্স কম! প্রয়োজন ৳{sell_price:.2f}, আপনার আছে ৳{bal:.2f}। আগে ডিপোজিট করুন।"
+            f"⚠️ ব্যালেন্স কম! প্রয়োজন ৳{sell_price:.2f}, আপনার আছে ৳{bal:.2f}। আগে ডিপোজিট করুন।",
+            reply_markup=main_menu(user.id),
         )
         return
 
     pbal_res = panel_balance()
     if not pbal_res.get("ok") or float(pbal_res.get("balance", 0.0)) < panel_cost:
         await update.message.reply_text(
-            "⚠️ প্যানেলে পর্যাপ্ত ব্যালেন্স নেই বা প্যানেল সংযোগ ব্যর্থ হয়েছে। কোনো টাকা কাটা হয়নি।"
+            "⚠️ প্যানেলে পর্যাপ্ত ব্যালেন্স নেই বা প্যানেল সংযোগ ব্যর্থ হয়েছে। কোনো টাকা কাটা হয়নি।",
+            reply_markup=main_menu(user.id),
         )
         return
 
@@ -5119,7 +5079,8 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     add_res = panel_add_order(pid, link, qty)
     if not add_res.get("ok"):
         await update.message.reply_text(
-            f"❌ প্যানেল অর্ডার গ্রহণ করেনি: {add_res.get('error')}\nকোনো টাকা কাটা হয়নি।"
+            f"❌ প্যানেল অর্ডার গ্রহণ করেনি: {add_res.get('error')}\nকোনো টাকা কাটা হয়নি।",
+            reply_markup=main_menu(user.id),
         )
         return
 
@@ -5158,7 +5119,8 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     schedule_order_sheet_backup(oid)
 
     await update.message.reply_text(
-        f"✅ Mini App অর্ডার সফল (#SMM-{oid} | Panel #{panel_oid})!\n📦 {name}\n💰 ৳{sell_price:.2f}"
+        f"✅ Mini App অর্ডার সফল (#SMM-{oid} | Panel #{panel_oid})!\n📦 {name}\n💰 ৳{sell_price:.2f}",
+        reply_markup=main_menu(user.id),
     )
     await notify_admin_new_order(
         context,
@@ -5300,7 +5262,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ---------------- ADMIN MENU ACTIONS ----------------
     if text == BTN_ADMIN:
         if not is_admin(user.id):
-            await update.message.reply_text("⛔ শুধুমাত্র অ্যাডমিন প্রবেশ করতে পারবে।")
+            await update.message.reply_text("⛔ শুধুমাত্র অ্যাডমিন প্রবেশ করতে পারবে।", reply_markup=main_menu(user.id))
             return
         await show_admin_panel(update, context)
         return
@@ -5625,7 +5587,6 @@ def main() -> None:
     application = Application.builder().token(token).build()
 
     application.add_handler(CommandHandler("start", start_cmd))
-    application.add_handler(CommandHandler("menu", menu_cmd))
     application.add_handler(CommandHandler("admin", show_admin_panel))
     application.add_handler(
         MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data)
@@ -5662,7 +5623,6 @@ def main() -> None:
         CallbackQueryHandler(handle_edit_service_cb, pattern="^edit_[0-9]+$")
     )
     application.add_handler(CallbackQueryHandler(handle_force_check_cb, pattern="^force_check$"))
-    application.add_handler(CallbackQueryHandler(handle_menu_cb, pattern="^menu_"))
     application.add_handler(
         CallbackQueryHandler(handle_admin_settings_cb, pattern="^adm_(set|toggle|force)_")
     )
