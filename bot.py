@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-👑 VIP BIG SMM PANEL BOT — Final Production Edition
+👑 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL — Final Production Edition
 ====================================================
 Features:
   • Colored ReplyKeyboard Buttons (Primary Blue, Success Green, Danger Red — Telegram Bot API 9.4+ compatible)
@@ -70,6 +70,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Configuration & Logging
 # ---------------------------------------------------------------------------
+BOT_DISPLAY_NAME = "𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL"
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vip_smm_bot.db")
 _db_lock = threading.Lock()
 _sheets_lock = threading.Lock()
@@ -619,11 +620,11 @@ def _mkb(text: str, style: str = "primary", web_app: WebAppInfo | None = None) -
 # ---------------------------------------------------------------------------
 # Button Labels (User & Admin)
 # ---------------------------------------------------------------------------
-BTN_NEW_ORDER = "🚀 নতুন অর্ডার (SMM)"
+BTN_NEW_ORDER = "🚀 নতুন অর্ডার"
 BTN_MINIAPP = "📱 Mini Bot Open"
 BTN_SERVICES = "📋 সার্ভিস লিস্ট"
-BTN_MY_ORDERS = "📦 আমার অর্ডার"
 BTN_DEPOSIT = "💰 ডিপোজিট"
+BTN_MY_ORDERS = "📦 আমার অর্ডার"
 BTN_PROFILE = "👤 প্রোফাইল"
 BTN_REFER = "👥 রেফারেল"
 BTN_LEADERBOARD = "🏆 লিডারবোর্ড"
@@ -655,6 +656,7 @@ ST_ORDER_QTY = "order_qty"
 ST_ORDER_CONFIRM = "order_confirm"
 ST_DEP_AMOUNT = "dep_amount"
 ST_DEP_TRXID = "dep_trxid"
+ST_DEP_SUBMIT = "dep_submit"
 ST_SUPPORT_MSG = "support_msg"
 
 # Admin Add Service States
@@ -1242,7 +1244,57 @@ def format_min_max(s: sqlite3.Row, admin_view: bool = False) -> str:
     elif admin_view:
         parts.append("Max: Editable in Admin")
 
-    return " | ".join(parts) if parts else "Flexible Quantity"
+    return " | ".join(parts) if parts else ""
+
+
+def format_user_service_block(s: sqlite3.Row) -> str:
+    """
+    Formats a single service block for normal users:
+    Shows ONLY: service name, sell price, refill, Min, Max, average time 2-6 hours.
+    Never shows panel rate, profit, or panel ID to normal users.
+    """
+    sell_rate = get_sell_rate_per_1k(s)
+    sell_str = _fmt_num(sell_rate)
+    refill_txt = get_refill_label(s)
+    avg_t = get_avg_time_label(s)
+    mn = int(s["min_qty"] or 0)
+    mx = int(s["max_qty"] or 0)
+    limit_parts = []
+    if mn > 0:
+        limit_parts.append(f"Min: <b>{mn}</b>")
+    if mx > 0:
+        limit_parts.append(f"Max: <b>{mx}</b>")
+    elif mx == -1:
+        limit_parts.append("Max: <b>Unlimited</b>")
+
+    lines = [
+        f"🔹 <b>{s['name']}</b>",
+        f"💰 <b>মূল্য:</b> ৳{sell_str} / 1000",
+        f"🔄 <b>রিফিল:</b> {refill_txt}",
+    ]
+    if limit_parts:
+        lines.append(f"📊 <b>লিমিট:</b> {' | '.join(limit_parts)}")
+    lines.append(f"⏱️ <b>Average time:</b> {avg_t}")
+    return "\n".join(lines)
+
+
+def build_single_column_service_buttons(
+    services: list[sqlite3.Row], include_back_to_cats: bool = False
+) -> InlineKeyboardMarkup:
+    """
+    Builds single-column inline buttons (one service per row) with text:
+    "TikTok Followers — ৳180/1K"
+    """
+    rows = []
+    for s in services:
+        sell_str = _fmt_num(get_sell_rate_per_1k(s))
+        btn_text = f"{s['name']} — ৳{sell_str}/1K"
+        rows.append([InlineKeyboardButton(btn_text, callback_data=f"srv_{s['id']}")])
+    if include_back_to_cats:
+        rows.append(
+            [InlineKeyboardButton("🔙 প্ল্যাটফর্ম তালিকায় ফিরুন", callback_data="open_cats")]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -1447,61 +1499,141 @@ def get_service(service_id: int) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM services WHERE id = ?", (service_id,)).fetchone()
 
 
-def vip_badge(total_spent: float) -> str:
-    if total_spent >= 5000:
+def get_user_completed_amount(user_id: int) -> float:
+    """Returns total COMPLETED order amount only for a user."""
+    with _db_lock, db() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(CASE WHEN sell_price > 0 THEN sell_price ELSE price END), 0.0)
+            FROM orders
+            WHERE buyer_id = ? AND LOWER(status) IN ('completed', 'approved')
+            """,
+            (user_id,),
+        ).fetchone()
+        return round(float(row[0] or 0.0), 2) if row else 0.0
+
+
+def vip_badge(completed_amount: float) -> str:
+    if completed_amount >= 1000:
         return "👑 VVIP Legend"
-    if total_spent >= 2000:
+    if completed_amount >= 500:
         return "💎 Royal Diamond"
-    if total_spent >= 500:
+    if completed_amount >= 300:
         return "🥇 Gold VIP"
-    if total_spent >= 100:
+    if completed_amount >= 100:
         return "🥈 Silver Pro"
     return "🥉 Bronze Member"
 
 
+def vip_discount(completed_amount: float) -> int:
+    """
+    Returns VIP discount % based on total COMPLETED order amount only:
+    Silver Pro (>= ৳100) = 3%
+    Gold VIP (>= ৳300) = 5%
+    Royal Diamond (>= ৳500) = 7%
+    VVIP Legend (>= ৳1000) = 10%
+    """
+    if completed_amount >= 1000:
+        return 10
+    if completed_amount >= 500:
+        return 7
+    if completed_amount >= 300:
+        return 5
+    if completed_amount >= 100:
+        return 3
+    return 0
+
+
+def get_vip_info(user_id: int) -> dict:
+    """
+    Returns VIP status details based on total COMPLETED order amount only:
+    current rank, total completed amount, next rank + remaining amount, and current discount %.
+    """
+    comp_amt = get_user_completed_amount(user_id)
+    rank = vip_badge(comp_amt)
+    disc_pct = vip_discount(comp_amt)
+    tiers = [
+        (100.0, "🥈 Silver Pro"),
+        (300.0, "🥇 Gold VIP"),
+        (500.0, "💎 Royal Diamond"),
+        (1000.0, "👑 VVIP Legend"),
+    ]
+    next_rank = None
+    remaining_amt = 0.0
+    for threshold, r_name in tiers:
+        if comp_amt < threshold:
+            next_rank = r_name
+            remaining_amt = round(max(0.0, threshold - comp_amt), 2)
+            break
+    return {
+        "rank": rank,
+        "completed_amount": comp_amt,
+        "discount_pct": disc_pct,
+        "next_rank": next_rank,
+        "remaining_amount": remaining_amt,
+    }
+
+
+def format_vip_section(user_id: int) -> str:
+    v = get_vip_info(user_id)
+    if v["next_rank"]:
+        next_line = f"{v['next_rank']} (আরও <b>৳{v['remaining_amount']:.2f}</b> প্রয়োজন)"
+    else:
+        next_line = "👑 সর্বোচ্চ র‍্যাংক অর্জিত (বাকি: ৳0.00)"
+    return (
+        "👑 <b>ভিআইপি স্ট্যাটাস (VIP Section):</b>\n"
+        f"🏆 <b>Current Rank:</b> {v['rank']}\n"
+        f"✅ <b>Total Completed Amount:</b> ৳{v['completed_amount']:.2f}\n"
+        f"🎯 <b>Next Rank:</b> {next_line}\n"
+        f"🎁 <b>Current Discount:</b> <b>{v['discount_pct']}%</b>"
+    )
+
+
+def calc_vip_order_price(
+    s: sqlite3.Row, quantity: int, user_id: int
+) -> tuple[float, int, float]:
+    """
+    Applies VIP discount (based on total COMPLETED order amount only) to sell price at order time.
+    Returns (original_price, discount_pct, final_price).
+    """
+    original_price = calc_sell_price(s, quantity)
+    comp_amt = get_user_completed_amount(user_id)
+    disc_pct = vip_discount(comp_amt)
+    if disc_pct > 0:
+        final_price = round(original_price * (100.0 - disc_pct) / 100.0, 2)
+    else:
+        final_price = original_price
+    return (original_price, disc_pct, final_price)
+
+
 def payment_numbers_text() -> str:
-    bkash = get_setting("bkash_number")
-    nagad = get_setting("nagad_number")
-    rocket = get_setting("rocket_number")
-    binance = get_setting("binance_id")
+    bkash = get_setting("bkash_number") or os.environ.get("BKASH_NUMBER", "").strip()
+    nagad = get_setting("nagad_number") or os.environ.get("NAGAD_NUMBER", "").strip()
+    rocket = get_setting("rocket_number") or os.environ.get("ROCKET_NUMBER", "").strip()
+    binance = get_setting("binance_id") or os.environ.get("BINANCE_ID", "").strip()
     lines = []
     if bkash:
-        lines.append(f"🌸 <b>bKash (Personal/Send Money):</b> <code>{bkash}</code>")
+        lines.append(f"🌸 <b>bKash Personal (Send Money):</b> <code>{bkash}</code>")
     if nagad:
-        lines.append(f"🧡 <b>Nagad (Send Money):</b> <code>{nagad}</code>")
+        lines.append(f"🧡 <b>Nagad Personal (Send Money):</b> <code>{nagad}</code>")
     if rocket:
-        lines.append(f"💜 <b>Rocket (Send Money):</b> <code>{rocket}</code>")
+        lines.append(f"💜 <b>Rocket Personal (Send Money):</b> <code>{rocket}</code>")
     if binance:
         lines.append(f"🟡 <b>Binance Pay ID / USDT:</b> <code>{binance}</code>")
     if not lines:
-        return "⚠️ পেমেন্ট নাম্বার এখনো সেট করা হয়নি। অ্যাডমিনের সাথে যোগাযোগ করুন।"
+        return "🌸 <b>bKash Personal (Send Money):</b> অ্যাডমিন প্যানেল থেকে নাম্বার সেট করুন।"
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Colored Reply Keyboards (User & Admin)
+# Main Menu (6 buttons only: নতুন অর্ডার, সার্ভিস লিস্ট, ডিপোজিট, আমার অর্ডার, প্রোফাইল, রেফারেল)
 # ---------------------------------------------------------------------------
 def main_menu(user_id: int) -> ReplyKeyboardMarkup:
-    web_app_url = os.environ.get("WEB_APP_URL", "").strip()
-    rows = []
-    if web_app_url:
-        rows.append(
-            [
-                _mkb(BTN_NEW_ORDER, "danger"),
-                _mkb(BTN_MINIAPP, "primary", web_app=WebAppInfo(url=web_app_url)),
-            ]
-        )
-    else:
-        rows.append([_mkb(BTN_NEW_ORDER, "danger")])
-
-    rows.extend(
-        [
-            [_mkb(BTN_PROFILE, "primary"), _mkb(BTN_DEPOSIT, "success")],
-            [_mkb(BTN_SERVICES, "primary"), _mkb(BTN_MY_ORDERS, "danger")],
-            [_mkb(BTN_REFER, "success"), _mkb(BTN_LEADERBOARD, "primary")],
-            [_mkb(BTN_MISSION, "success"), _mkb(BTN_SUPPORT, "danger")],
-        ]
-    )
+    rows = [
+        [_mkb(BTN_NEW_ORDER, "danger"), _mkb(BTN_SERVICES, "primary")],
+        [_mkb(BTN_DEPOSIT, "success"), _mkb(BTN_MY_ORDERS, "primary")],
+        [_mkb(BTN_PROFILE, "primary"), _mkb(BTN_REFER, "success")],
+    ]
     if is_admin(user_id):
         rows.append([_mkb(BTN_ADMIN, "primary")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -1525,7 +1657,7 @@ def cancel_menu() -> ReplyKeyboardMarkup:
 
 
 # ---------------------------------------------------------------------------
-# Main Welcome & Dashboard (/start)
+# Main Welcome & Dashboard (/start) — No Quick Action Panel
 # ---------------------------------------------------------------------------
 async def show_main_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -1535,60 +1667,31 @@ async def show_main_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE
             "SELECT COUNT(*) FROM orders WHERE buyer_id = ?", (user.id,)
         ).fetchone()[0]
 
-    badge = vip_badge(float(u["total_spent"]))
+    comp_amt = get_user_completed_amount(user.id)
+    badge = vip_badge(comp_amt)
     text = (
         f"👑 <b>স্বাগতম, {user.first_name}!</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🌟 <b>VIP SMM PANEL</b>\n"
+        "─────────\n"
+        "🌟 <b>𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
         "স্বয়ংক্রিয় সোশ্যাল মিডিয়া বুস্ট প্যানেলে আপনাকে স্বাগতম!\n\n"
         "📊 <b>আপনার অ্যাকাউন্ট ড্যাশবোর্ড:</b>\n"
-        f"├─ 🆔 <b>User ID:</b> <code>{user.id}</code>\n"
-        f"├─ 💳 <b>বর্তমান ব্যালেন্স:</b> <b>৳{u['balance']:.2f}</b>\n"
-        f"├─ 📦 <b>মোট অর্ডার:</b> {order_cnt} টি\n"
-        f"└─ 🏆 <b>ভিআইপি র‍্যাংক:</b> {badge}\n\n"
-        "🔥 <b>আমাদের অ্যাক্টিভ সার্ভিসসমূহ (⏱️ Average time: 2-6 hours):</b>\n"
-        "├─ 📸 Instagram (Followers, Likes, Views, Impression)\n"
-        "├─ 🎵 TikTok (Followers, Likes, Views, Shares)\n"
-        "├─ 📘 Facebook (Followers, Reaction [Love] - Bot Data, Views)\n"
-        "└─ ▶️ YouTube (Views, Likes)\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 <b>শুরু করতে নিচের রঙিন মেনু বা বাটন সিলেক্ট করুন:</b>"
+        f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
+        f"💳 <b>বর্তমান ব্যালেন্স:</b> <b>৳{u['balance']:.2f}</b>\n"
+        f"📦 <b>মোট অর্ডার:</b> {order_cnt} টি\n"
+        f"🏆 <b>ভিআইপি র‍্যাংক:</b> {badge}\n\n"
+        "🔥 <b>অ্যাক্টিভ প্ল্যাটফর্মসমূহ (⏱️ Average time: 2-6 hours):</b>\n"
+        "📸 <b>Instagram</b> • 🎵 <b>TikTok</b> • 📘 <b>Facebook</b> • ▶️ <b>YouTube</b>\n"
+        "─────────\n"
+        "👇 শুরু করতে নিচের মেনু থেকে বাটন সিলেক্ট করুন:"
     )
-
-    web_app_url = os.environ.get("WEB_APP_URL", "").strip()
-    inline_rows = [
-        [
-            InlineKeyboardButton("🚀 দ্রুত অর্ডার করুন", callback_data="open_cats"),
-            InlineKeyboardButton("💰 ব্যালেন্স অ্যাড", callback_data="open_deposit"),
-        ]
-    ]
-    if web_app_url:
-        inline_rows.insert(
-            0,
-            [
-                InlineKeyboardButton(
-                    "🔥 VIP SMM প্যানেল চালু করুন (Mini App)",
-                    web_app=WebAppInfo(url=web_app_url),
-                )
-            ],
-        )
-
-    inline_kb = InlineKeyboardMarkup(inline_rows)
 
     if update.message:
         await update.message.reply_text(
             text, parse_mode="HTML", reply_markup=main_menu(user.id)
         )
-        await update.message.reply_text(
-            "⚡ <b>কুইক অ্যাকশন প্যানেল:</b>",
-            parse_mode="HTML",
-            reply_markup=inline_kb,
-        )
     elif update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            text, parse_mode="HTML", reply_markup=inline_kb
-        )
+        await update.callback_query.edit_message_text(text, parse_mode="HTML")
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1627,16 +1730,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SMM Categories & Service Listing
+# SMM Categories & Easy-to-Read Service Listing
 # ---------------------------------------------------------------------------
 def build_categories_keyboard() -> InlineKeyboardMarkup:
     cats = list_categories(include_disabled=False)
-    rows = []
-    for i in range(0, len(cats), 2):
-        pair = cats[i : i + 2]
-        rows.append(
-            [InlineKeyboardButton(c, callback_data=f"cat_{idx + i}") for idx, c in enumerate(pair)]
-        )
+    rows = [[InlineKeyboardButton(c, callback_data=f"cat_{idx}")] for idx, c in enumerate(cats)]
     return InlineKeyboardMarkup(rows)
 
 
@@ -1651,10 +1749,10 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     text = (
-        "🚀 <b>VIP SMM নতুন অর্ডার প্যানেল</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⏱️ <b>Average delivery time:</b> 2-6 hours\n"
-        "আপনি কোন প্ল্যাটফর্মের সার্ভিস নিতে চান? নিচের বাটন থেকে সিলেক্ট করুন:"
+        "🚀 <b>নতুন অর্ডার — 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
+        "─────────\n"
+        "⏱️ <b>Average time:</b> 2-6 hours\n\n"
+        "👇 আপনি কোন প্ল্যাটফর্মের সার্ভিস নিতে চান? নিচ থেকে সিলেক্ট করুন:"
     )
     kb = build_categories_keyboard()
     if update.message:
@@ -1665,52 +1763,96 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def show_all_services_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    User Service List (📋 সার্ভিস লিস্ট):
+    - One service per block, blank line between services.
+    - Normal users see ONLY: service name, sell price, refill, Min, Max, average time 2-6 hours.
+    - Never shows panel rate, profit, or panel ID.
+    - Single-column service buttons: one service per row, text = "TikTok Followers — ৳180/1K".
+    - Does NOT repeat the 4 platform buttons under the service list.
+    """
     user_id = update.effective_user.id
-    admin_view = is_admin(user_id)
-    services = list_services(include_disabled=admin_view)
+    services = list_services(include_disabled=False)
     if not services:
         await update.message.reply_text(
             "কোনো সার্ভিস নেই।", reply_markup=main_menu(user_id)
         )
         return
-    lines = [
-        "📋 <b>আমাদের সকল অ্যাক্টিভ SMM সার্ভিস লিস্ট:</b>\n"
-        "⏱️ <b>Average Time:</b> 2-6 hours\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
+
+    sections = [
+        "📋 <b>সার্ভিস লিস্ট — 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
+        "⏱️ <b>Average time:</b> 2-6 hours\n"
+        "─────────"
+    ]
+    current_cat = None
+    cat_blocks = []
+    for s in services:
+        if s["category"] != current_cat:
+            if cat_blocks:
+                sections.append("\n\n".join(cat_blocks))
+                cat_blocks = []
+            current_cat = s["category"]
+            sections.append(f"\n<b>{current_cat}</b>\n─────────")
+        cat_blocks.append(format_user_service_block(s))
+    if cat_blocks:
+        sections.append("\n\n".join(cat_blocks))
+
+    sections.append("─────────\n👇 অর্ডার করতে নিচের সার্ভিস বাটনে চাপুন:")
+    text = "\n".join(sections)
+    kb = build_single_column_service_buttons(services, include_back_to_cats=False)
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+async def admin_show_all_services(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Admin Service List (📋 সব সার্ভিস দেখুন in Admin Panel):
+    Shows Panel Service ID, Panel Rate, Sell Price, Profit, Refill, Min, Max, Average time.
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    services = list_services(include_disabled=True)
+    if not services:
+        await update.message.reply_text(
+            "কোনো সার্ভিস নেই।", reply_markup=admin_menu()
+        )
+        return
+
+    blocks = [
+        "📋 <b>ADMIN SERVICE LIST — 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
+        "⏱️ <b>Average time:</b> 2-6 hours\n"
+        "─────────"
     ]
     current_cat = None
     for s in services:
         if s["category"] != current_cat:
             current_cat = s["category"]
-            lines.append(f"\n💠 <b>{current_cat}</b>")
+            blocks.append(f"\n<b>{current_cat}</b>\n─────────")
         sell_rate = get_sell_rate_per_1k(s)
         sell_str = _fmt_num(sell_rate)
+        p_rate = float(s["panel_rate"] or 0.0)
+        profit_1k = round(sell_rate - p_rate, 4) if p_rate > 0 else 0.0
         pid = int(s["panel_service_id"] or 0)
         refill_txt = get_refill_label(s)
         avg_t = get_avg_time_label(s)
-        mm_txt = format_min_max(s, admin_view=admin_view)
-        bot_data_tag = " | 🤖 <b>Bot Data</b>" if "bot data" in (s["name"] + " " + s["description"]).lower() else ""
+        mm_txt = format_min_max(s, admin_view=True)
         active_tag = "" if int(s["is_active"] or 0) == 1 else " [DISABLED]"
-        if admin_view:
-            p_rate = float(s["panel_rate"] or 0.0)
-            profit_1k = round(sell_rate - p_rate, 4) if p_rate > 0 else 0.0
-            lines.append(
-                f"  ├─ 🆔 <b>#{s['id']}</b> {s['name']}{active_tag}\n"
-                f"  │    💰 Sell: <b>৳{sell_str}/1000</b> | Panel Rate: <b>{_fmt_num(p_rate)}/1000</b> | Profit: <b>{_fmt_num(profit_1k)}/1000</b>\n"
-                f"  │    🔗 Panel ID: <code>#{pid}</code> | 🔄 {refill_txt}{bot_data_tag} | ⏱️ {avg_t}\n"
-                f"  │    📊 {mm_txt}"
-            )
-        else:
-            lines.append(
-                f"  ├─ 🆔 <b>#{s['id']}</b> {s['name']}\n"
-                f"  │    💰 মূল্য: <b>৳{sell_str} / 1000</b> | 🔄 {refill_txt}{bot_data_tag}\n"
-                f"  │    ⏱️ Average time: {avg_t} | 📊 {mm_txt}"
-            )
-    lines.append("\n👇 অর্ডার করতে <b>🚀 নতুন অর্ডার (SMM)</b> বাটনে চাপুন:")
+        blocks.append(
+            f"🔹 <b>#{s['id']} {s['name']}</b>{active_tag}\n"
+            f"🔗 <b>Panel ID:</b> <code>#{pid}</code>\n"
+            f"💵 <b>Panel Rate:</b> {_fmt_num(p_rate)}/1000 | 💰 <b>Sell:</b> ৳{sell_str}/1000 | 📈 <b>Profit:</b> ৳{_fmt_num(profit_1k)}/1000\n"
+            f"🔄 <b>Refill:</b> {refill_txt} | ⏱️ <b>Avg:</b> {avg_t}\n"
+            f"📊 {mm_txt}"
+        )
+
     await update.message.reply_text(
-        "\n".join(lines),
+        "\n\n".join(blocks),
         parse_mode="HTML",
-        reply_markup=build_categories_keyboard(),
+        reply_markup=admin_menu(),
     )
 
 
@@ -1742,34 +1884,18 @@ async def handle_category_And_service_cb(
             return
         cat_name = cats[idx]
         svcs = list_services(cat_name, include_disabled=False)
-        lines = [
-            f"💠 <b>ক্যাটাগরি: {cat_name}</b>\n"
-            "⏱️ <b>Average time:</b> 2-6 hours\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "নিচ থেকে আপনার পছন্দের সার্ভিসটি সিলেক্ট করুন:\n"
-        ]
-        buttons = []
-        for s in svcs:
-            sell_rate = get_sell_rate_per_1k(s)
-            sell_str = _fmt_num(sell_rate)
-            refill_tag = get_refill_label(s)
-            avg_t = get_avg_time_label(s)
-            mm_txt = format_min_max(s, admin_view=False)
-            bot_data_note = " | 🤖 Bot Data" if "bot data" in (s["name"] + " " + s["description"]).lower() else ""
-            lines.append(
-                f"🔹 <b>{s['name']}</b>\n"
-                f"   💰 মূল্য: <b>৳{sell_str}/1000</b> | 🔄 {refill_tag}{bot_data_note}\n"
-                f"   ⏱️ Avg Time: {avg_t} | {mm_txt}\n"
-            )
-            btn_label = f"🛒 {s['name']} (৳{sell_str}/1K • {refill_tag})"
-            buttons.append(
-                [InlineKeyboardButton(btn_label, callback_data=f"srv_{s['id']}")]
-            )
-        buttons.append([InlineKeyboardButton("🔙 ক্যাটাগরি লিস্টে ফিরুন", callback_data="open_cats")])
+        service_blocks = [format_user_service_block(s) for s in svcs]
+        text = (
+            f"<b>{cat_name} — 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
+            "─────────\n\n"
+            + "\n\n".join(service_blocks)
+            + "\n\n─────────\n👇 অর্ডার করতে নিচের সার্ভিস বাটনে চাপুন:"
+        )
+        kb = build_single_column_service_buttons(svcs, include_back_to_cats=True)
         await query.edit_message_text(
-            "\n".join(lines),
+            text,
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=kb,
         )
         return
 
@@ -1823,16 +1949,16 @@ async def handle_category_And_service_cb(
         context.user_data.clear()
         context.user_data["state"] = ST_ORDER_LINK
         context.user_data["order_service_id"] = s["id"]
+        limit_line = f"📊 <b>লিমিট:</b> {mm_txt}\n" if mm_txt else ""
         text = (
-            f"🚀 <b>সার্ভিস: {s['name']}</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🆔 <b>Panel Service ID:</b> <code>#{pid}</code>\n"
-            f"💰 <b>মূল্য (প্রতি ১০০০):</b> <b>৳{sell_str}</b>\n"
-            f"📊 <b>লিমিট:</b> {mm_txt}\n"
+            f"🚀 <b>{s['name']}</b>\n"
+            "─────────\n"
+            f"💰 <b>মূল্য:</b> <b>৳{sell_str} / 1000</b>\n"
             f"🔄 <b>রিফিল:</b> {refill_txt}\n"
+            f"{limit_line}"
             f"⏱️ <b>Average time:</b> {avg_t}\n"
             f"{bot_data_line}"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "─────────\n"
             f"🔗 <b>ধাপ ১/৩:</b> আপনার <b>টার্গেট লিংক{plat_hint}</b> পাঠান:\n"
             "<i>(লিংক অবশ্যই http:// বা https:// দিয়ে শুরু হতে হবে এবং পাবলিক থাকতে হবে)</i>"
         )
@@ -1880,7 +2006,7 @@ async def handle_category_And_service_cb(
             )
             return
 
-        sell_price = calc_sell_price(s, qty)
+        original_price, disc_pct, sell_price = calc_vip_order_price(s, qty, user.id)
         panel_cost = calc_panel_cost(s, qty)
 
         # Step 5a: Check user wallet balance
@@ -1972,18 +2098,18 @@ async def handle_category_And_service_cb(
         schedule_order_sheet_backup(order_id)
 
         await query.edit_message_text(
-            "🎉 <b>আপনার অর্ডার সফলভাবে প্যানেলে সাবমিট হয়েছে!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🧾 <b>Bot Order ID:</b> <code>#SMM-{order_id}</code>\n"
-            f"🌐 <b>Panel Order ID:</b> <code>#{panel_oid}</code>\n"
-            f"📦 <b>সার্ভিস:</b> {s['name']} (Service #{pid})\n"
+            "🎉 <b>আপনার অর্ডার সফলভাবে সাবমিট হয়েছে!</b>\n"
+            "─────────\n"
+            f"🧾 <b>Order ID:</b> <code>#SMM-{order_id}</code>\n"
+            f"📦 <b>সার্ভিস:</b> {s['name']}\n"
             f"🔗 <b>লিংক:</b> <code>{link}</code>\n"
-            f"🔢 <b>পরিমাণ:</b> {qty}\n"
-            f"💰 <b>মোট চার্জ:</b> ৳{sell_price:.2f}\n"
+                        f"🔢 <b>পরিমাণ:</b> {qty}\n"
+            f"💵 <b>Original price:</b> ৳{original_price:.2f} | 🎁 <b>Discount:</b> {disc_pct}%\n"
+            f"💰 <b>Final price (মোট চার্জ):</b> ৳{sell_price:.2f}\n"
             f"💳 <b>নতুন ব্যালেন্স:</b> ৳{new_bal:.2f}\n"
             f"⏱️ <b>Average time:</b> {get_avg_time_label(s)}\n"
             "⏳ <b>স্ট্যাটাস:</b> Pending\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "─────────\n"
             "📦 <b>আমার অর্ডার</b> মেনু থেকে যেকোনো সময় লাইভ স্ট্যাটাস চেক করতে পারবেন।",
             parse_mode="HTML",
         )
@@ -2363,34 +2489,96 @@ async def handle_user_order_actions_cb(
 
 
 # ---------------------------------------------------------------------------
-# Deposit / Add Balance Flow
+# 4. DEPOSIT FLOW — Clean 5 Steps:
+#    1) Amount -> 2) bKash Personal Send Money -> 3) TrxID -> 4) Submit for Admin Approval -> 5) Clear Confirmation
 # ---------------------------------------------------------------------------
 async def start_deposit_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    context.user_data["state"] = ST_DEP_AMOUNT
+    context.user_data["dep_method"] = "bKash Personal (Send Money)"
     text = (
-        "💰 <b>ওয়ালেট ডিপোজিট (Add Balance)</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "নিচের যেকোনো নাম্বারে <b>Send Money</b> করুন:\n\n"
-        f"{payment_numbers_text()}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 আপনি কোন মেথডে টাকা পাঠিয়েছেন সিলেক্ট করুন:"
-    )
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🌸 bKash", callback_data="dep_m_bKash"),
-                InlineKeyboardButton("🧡 Nagad", callback_data="dep_m_Nagad"),
-            ],
-            [
-                InlineKeyboardButton("💜 Rocket", callback_data="dep_m_Rocket"),
-                InlineKeyboardButton("🟡 Binance", callback_data="dep_m_Binance"),
-            ],
-        ]
+        "💰 <b>ডিপোজিট — 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
+        "─────────\n"
+        "💵 <b>ধাপ ১: টাকার পরিমাণ (Amount)</b>\n"
+        "আপনি কত টাকা ডিপোজিট করতে চান? নিচে সংখ্যায় লিখুন (যেমন: <code>100</code>):"
     )
     if update.message:
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+        await update.message.reply_text(
+            text, parse_mode="HTML", reply_markup=cancel_menu()
+        )
     elif update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        await update.callback_query.edit_message_text(text, parse_mode="HTML")
+        await context.bot.send_message(
+            chat_id=update.callback_query.from_user.id,
+            text="💵 টাকার পরিমাণ লিখুন (বাতিল করতে ❌ বাতিল করুন চাপুন):",
+            reply_markup=cancel_menu(),
+        )
+
+
+async def _finalize_deposit_submission(
+    user,
+    method: str,
+    amt: float,
+    trxid: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[int, str]:
+    with _db_lock, db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO balance_requests (buyer_id, buyer_name, method, amount, trxid, status)
+            VALUES (?, ?, ?, ?, ?, 'pending')
+            """,
+            (user.id, user.first_name or "User", method, amt, trxid),
+        )
+        req_id = cur.lastrowid
+        conn.commit()
+
+    confirm_text = (
+        "✅ <b>ডিপোজিট রিকোয়েস্ট সফলভাবে সাবমিট হয়েছে!</b>\n"
+        "─────────\n"
+        "🌟 <b>𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
+        f"🧾 <b>Request ID:</b> <code>#DEP-{req_id}</code>\n"
+        f"🌸 <b>মেথড:</b> {method}\n"
+        f"💰 <b>পরিমাণ:</b> <b>৳{amt:.2f}</b>\n"
+        f"🔢 <b>TrxID:</b> <code>{trxid}</code>\n"
+        "⏳ <b>স্ট্যাটাস:</b> Pending Admin Approval\n"
+        "─────────\n"
+        "অ্যাডমিন আপনার পেমেন্ট যাচাই করে অ্যাপ্রুভ করার সাথে সাথে ওয়ালেটে ব্যালেন্স যোগ হয়ে যাবে।"
+    )
+
+    aid = _admin_id()
+    if aid:
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Approve Balance", callback_data=f"approve_bal_{req_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Reject", callback_data=f"reject_bal_{req_id}"
+                    ),
+                ]
+            ]
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=aid,
+                text=(
+                    "💳 <b>নতুন ডিপোজিট রিকোয়েস্ট — 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
+                    "─────────\n"
+                    f"🧾 <b>Request ID:</b> <code>#DEP-{req_id}</code>\n"
+                    f"🌸 <b>মেথড:</b> {method}\n"
+                    f"💰 <b>পরিমাণ:</b> <b>৳{amt:.2f}</b>\n"
+                    f"🔢 <b>TrxID:</b> <code>{trxid}</code>\n"
+                    f"👤 <b>ইউজার:</b> {user.first_name} (<code>{user.id}</code>)"
+                ),
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+    return req_id, confirm_text
 
 
 async def handle_deposit_method_cb(
@@ -2398,20 +2586,51 @@ async def handle_deposit_method_cb(
 ) -> None:
     query = update.callback_query
     await query.answer()
-    method = (query.data or "").replace("dep_m_", "", 1)
+    data = query.data or ""
+    user = query.from_user
+
+    if data == "dep_cancel_cb":
+        context.user_data.clear()
+        await query.edit_message_text("❌ ডিপোজিট রিকোয়েস্ট বাতিল করা হয়েছে।")
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="মেইন মেনু:",
+            reply_markup=main_menu(user.id),
+        )
+        return
+
+    if data == "dep_submit_cb":
+        if context.user_data.get("state") != ST_DEP_SUBMIT:
+            await query.edit_message_text("⚠️ ডিপোজিট সেশনটির মেয়াদ শেষ হয়েছে। অনুগ্রহ করে আবার 💰 ডিপোজিট বাটনে চাপুন।")
+            return
+        method = str(context.user_data.get("dep_method", "bKash Personal (Send Money)"))
+        amt = float(context.user_data.get("dep_amount", 0.0))
+        trxid = str(context.user_data.get("dep_trxid", "")).strip()
+        context.user_data.clear()
+        if amt <= 0 or not trxid:
+            await query.edit_message_text("⚠️ ডিপোজিট তথ্য অসম্পূর্ণ। আবার চেষ্টা করুন।")
+            return
+        _, confirm_text = await _finalize_deposit_submission(
+            user, method, amt, trxid, context
+        )
+        await query.edit_message_text(confirm_text, parse_mode="HTML")
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="👇 আপনার মেইন মেনু:",
+            reply_markup=main_menu(user.id),
+        )
+        return
+
+    method = data.replace("dep_m_", "", 1) or "bKash Personal (Send Money)"
     context.user_data.clear()
     context.user_data["state"] = ST_DEP_AMOUNT
     context.user_data["dep_method"] = method
     await query.edit_message_text(
-        f"✅ <b>মেথড সিলেক্টেড: {method}</b>\n\n"
-        f"{payment_numbers_text()}\n\n"
-        "💵 <b>ধাপ ১/২:</b> আপনি কত টাকা পাঠিয়েছেন? (শুধু সংখ্যা লিখুন, যেমন: <code>100</code>):",
+        f"💰 <b>ডিপোজিট — 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
+        "─────────\n"
+        "💵 <b>ধাপ ১: টাকার পরিমাণ (Amount)</b>\n"
+        "আপনি কত টাকা ডিপোজিট করতে চান? (শুধু সংখ্যা লিখুন, যেমন: <code>100</code>):",
         parse_mode="HTML",
-    )
-    await context.bot.send_message(
-        chat_id=query.from_user.id,
-        text="💵 টাকার পরিমাণ লিখুন (বাতিল করতে ❌ বাতিল করুন চাপুন):",
-        reply_markup=cancel_menu(),
     )
 
 
@@ -2585,7 +2804,7 @@ async def handle_admin_decisions_cb(
                         f"💳 মেথড: {row['method']}\n"
                         f"💰 যোগ হয়েছে: <b>৳{row['amount']:.2f}</b>\n"
                         f"🏦 বর্তমান ব্যালেন্স: <b>৳{new_bal:.2f}</b>\n\n"
-                        "এখন আপনি যেকোনো VIP SMM সার্ভিস অর্ডার করতে পারবেন!"
+                        "এখন আপনি <b>𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>-এ যেকোনো সার্ভিস অর্ডার করতে পারবেন!"
                     ),
                     parse_mode="HTML",
                 )
@@ -2794,7 +3013,7 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not rows:
         await update.message.reply_text(
             "📦 <b>আপনার এখনো কোনো অর্ডার নেই।</b>\n\n"
-            "অর্ডার করতে <b>🚀 নতুন অর্ডার (SMM)</b> বাটনে ক্লিক করুন!",
+            "অর্ডার করতে <b>🚀 নতুন অর্ডার</b> বাটনে ক্লিক করুন!",
             parse_mode="HTML",
             reply_markup=main_menu(uid),
         )
@@ -2850,21 +3069,22 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             (user.id,),
         ).fetchone()[0]
 
-    badge = vip_badge(float(u["total_spent"]))
+    vip_sec = format_vip_section(user.id)
     text = (
-        "👤 <b>আপনার ভিআইপি প্রোফাইল ও ওয়ালেট</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "👤 <b>প্রোফাইল — 𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL</b>\n"
+        "─────────\n"
         f"📛 <b>নাম:</b> {user.first_name}\n"
         f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
-        f"🏆 <b>ভিআইপি র‍্যাংক:</b> {badge}\n\n"
+        "─────────\n"
+        f"{vip_sec}\n"
+        "─────────\n"
         "💳 <b>ওয়ালেট সামারি:</b>\n"
-        f"├─ 💰 <b>বর্তমান ব্যালেন্স:</b> <b>৳{u['balance']:.2f}</b>\n"
-        f"├─ 🏦 <b>মোট ডিপোজিট:</b> ৳{u['total_deposit']:.2f}\n"
-        f"└─ 🛒 <b>মোট খরচ:</b> ৳{u['total_spent']:.2f}\n\n"
-        "📊 <b>অ্যাক্টিভিটি সামারি:</b>\n"
-        f"├─ 📦 <b>মোট অর্ডার:</b> {total_orders} টি\n"
-        f"└─ ✅ <b>সম্পন্ন অর্ডার:</b> {comp_orders} টি\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
+        f"💰 <b>বর্তমান ব্যালেন্স:</b> <b>৳{u['balance']:.2f}</b>\n"
+        f"🏦 <b>মোট ডিপোজিট:</b> ৳{u['total_deposit']:.2f}\n"
+        f"🛒 <b>মোট খরচ:</b> ৳{u['total_spent']:.2f}\n"
+        "─────────\n"
+        "📊 <b>অর্ডার সামারি:</b>\n"
+        f"📦 <b>মোট অর্ডার:</b> {total_orders} টি | ✅ <b>সম্পন্ন:</b> {comp_orders} টি"
     )
     await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=main_menu(user.id)
@@ -2873,7 +3093,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def show_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Shows the referral rule ONLY in the Refer menu:
+    Short and clear referral menu (ONLY place where referral rule is shown):
     Refer bonus = 10% of the referred user's COMPLETED order amount only, never on join.
     """
     user = update.effective_user
@@ -2881,16 +3101,13 @@ async def show_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     bot_info = await context.bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start=ref_{user.id}"
     text = (
-        "👥 <b>রেফার করুন এবং আনলিমিটেড আয় করুন!</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎁 <b>রেফার বোনাস নিয়ম:</b>\n"
-        "আপনার রেফার করা ইউজারের <b>COMPLETED</b> অর্ডার অ্যামাউন্টের <b>10%</b> বোনাস পাবেন (শুধুমাত্র জয়েন করলে কোনো বোনাস নেই — অর্ডার সম্পন্ন হলেই ১০% কমিশন আপনার ওয়ালেটে যোগ হবে)।\n\n"
-        "🔗 <b>আপনার পার্সোনাল রেফারেল লিংক:</b>\n"
+        "👥 <b>রেফার করুন, আয় করুন!</b>\n"
+        "─────────\n"
+        "🎁 <b>নিয়ম:</b> আপনার রেফার করা ইউজারের COMPLETED অর্ডারের 10% আপনার ওয়ালেটে যোগ হবে।\n\n"
+        "🔗 <b>আপনার রেফারেল লিংক:</b>\n"
         f"<code>{ref_link}</code>\n\n"
-        "📊 <b>আপনার রেফারেল স্ট্যাটাস:</b>\n"
-        f"├─ 👥 <b>মোট রেফার:</b> {u['refer_count']} জন\n"
-        f"└─ 💰 <b>মোট রেফারেল বোনাস আয়:</b> ৳{u['refer_earned']:.2f} টাকা\n"
-        "━━━━━━━━━━━━━━━━━━━━━━"
+        "─────────\n"
+        f"👥 <b>মোট রেফার:</b> {u['refer_count']} জন | 💰 <b>মোট আয়:</b> ৳{u['refer_earned']:.2f}"
     )
     await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=main_menu(user.id)
@@ -2905,7 +3122,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
     lines = [
-        "🏆 <b>VIP লিডারবোর্ড (Top 5 Champions)</b>\n"
+        "🏆 <b>𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL — লিডারবোর্ড</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "💎 <b>টপ ভিআইপি ক্রেতা (Top Buyers):</b>"
     ]
@@ -2936,15 +3153,17 @@ async def show_missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     last_ts = int(u["last_daily_ts"] or 0)
     can_claim = daily_amt > 0 and (now_ts - last_ts >= 86400)
 
+    vip_sec = format_vip_section(user.id)
     text = (
-        "🎯 <b>ডেইলি বোনাস ও ভিআইপি মিশন</b>\n"
+        "🎯 <b>ডেইলি বোনাস ও ভিআইপি সেকশন</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎁 <b>ডেইলি লগইন বোনাস:</b> ৳{daily_amt:.2f} টাকা (প্রতি ২৪ ঘণ্টায় ১ বার)\n\n"
-        "🏆 <b>ভিআইপি র‍্যাংক মিশনসমূহ:</b>\n"
-        "├─ 🥈 <b>Silver Pro:</b> মোট ৳১০০ অর্ডার সম্পন্ন করুন\n"
-        "├─ 🥇 <b>Gold VIP:</b> মোট ৳৫০০ অর্ডার সম্পন্ন করুন\n"
-        "├─ 💎 <b>Royal Diamond:</b> মোট ৳২০০০ অর্ডার সম্পন্ন করুন\n"
-        "└─ 👑 <b>VVIP Legend:</b> মোট ৳৫০০০ অর্ডার সম্পন্ন করুন\n"
+        f"{vip_sec}\n\n"
+        "🏆 <b>ভিআইপি র‍্যাংক ও ডিসকাউন্ট চার্ট (Completed Order অনুযায়ী):</b>\n"
+        "├─ 🥈 <b>Silver Pro:</b> ≥ ৳100 (3% ডিসকাউন্ট)\n"
+        "├─ 🥇 <b>Gold VIP:</b> ≥ ৳300 (5% ডিসকাউন্ট)\n"
+        "├─ 💎 <b>Royal Diamond:</b> ≥ ৳500 (7% ডিসকাউন্ট)\n"
+        "└─ 👑 <b>VVIP Legend:</b> ≥ ৳1000 (10% ডিসকাউন্ট)\n\n"
+        f"🎁 <b>ডেইলি লগইন বোনাস:</b> ৳{daily_amt:.2f} টাকা (প্রতি ২৪ ঘণ্টায় ১ বার)\n"
         "━━━━━━━━━━━━━━━━━━━━━━"
     )
     kb = None
@@ -3034,7 +3253,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     gs_status = "✅ Active" if (sheet_id and creds_raw) else "⚠️ Not Configured (Skipped)"
 
     text = (
-        "📊 <b>VIP SMM ADMIN CONTROL PANEL</b>\n"
+        "📊 <b>𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL — ADMIN CONTROL</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{pbal_line}\n"
         f"📑 <b>Google Sheets Backup:</b> {gs_status}\n"
@@ -3396,7 +3615,7 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
             return True
 
         sell_rate = get_sell_rate_per_1k(s)
-        sell_price = calc_sell_price(s, qty)
+        original_price, disc_pct, final_price = calc_vip_order_price(s, qty, user.id)
         link = context.user_data.get("order_link", "")
         context.user_data["order_qty"] = qty
         context.user_data["state"] = ST_ORDER_CONFIRM
@@ -3405,7 +3624,7 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
             [
                 [
                     InlineKeyboardButton(
-                        f"✅ Confirm Order (৳{sell_price:.2f})",
+                        f"✅ Confirm Order (৳{final_price:.2f})",
                         callback_data="order_confirm_cb",
                     )
                 ],
@@ -3418,22 +3637,24 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
         )
         await update.message.reply_text(
             "🧾 <b>ধাপ ৩/৩: অর্ডার কনফার্মেশন</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📦 <b>সার্ভিস:</b> {s['name']} (Panel ID #{s['panel_service_id']})\n"
+            "─────────\n"
+            f"📦 <b>সার্ভিস:</b> {s['name']}\n"
             f"🔗 <b>লিংক:</b> <code>{link}</code>\n"
             f"🔢 <b>পরিমাণ (Quantity):</b> {qty}\n"
             f"🔄 <b>রিফিল:</b> {get_refill_label(s)}\n"
             f"⏱️ <b>Average time:</b> {get_avg_time_label(s)}\n"
             f"💰 <b>মূল্য (প্রতি ১০০০):</b> ৳{_fmt_num(sell_rate)}\n"
-            f"💳 <b>মোট মূল্য (Price):</b> <b>৳{sell_price:.2f}</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "👇 অর্ডারটি প্যানেলে পাঠাতে <b>Confirm Order</b> বাটনে চাপুন:",
+            f"💵 <b>Original price:</b> ৳{original_price:.2f}\n"
+            f"🎁 <b>Discount %:</b> {disc_pct}%\n"
+            f"💳 <b>Final price:</b> <b>৳{final_price:.2f}</b>\n"
+            "─────────\n"
+            "👇 অর্ডারটি কনফার্ম করতে নিচের বাটনে চাপুন:",
             parse_mode="HTML",
             reply_markup=kb,
         )
         return True
 
-    # 3. Deposit Amount -> Ask TrxID
+    # Deposit Step 1 -> Show Step 2 (bKash Personal Send Money) & Ask Step 3 (TrxID)
     if state == ST_DEP_AMOUNT:
         try:
             amt = float(text)
@@ -3448,74 +3669,58 @@ async def handle_stateful_input(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["dep_amount"] = round(amt, 2)
         context.user_data["state"] = ST_DEP_TRXID
         await update.message.reply_text(
-            f"💰 পরিমাণ: <b>৳{amt:.2f}</b>\n\n"
-            "🔢 <b>ধাপ ২/২:</b> এবার পেমেন্টের <b>Transaction ID (TrxID)</b> অথবা সেন্ডার নাম্বারের শেষ ৪ ডিজিট লিখে পাঠান:",
+            f"💰 <b>ডিপোজিট অ্যামাউন্ট: ৳{amt:.2f}</b>\n"
+            "─────────\n"
+            "🌸 <b>ধাপ ২: bKash Personal Send Money</b>\n"
+            f"নিচের নাম্বারে <b>৳{amt:.2f}</b> টাকা <b>Send Money</b> করুন:\n"
+            f"{payment_numbers_text()}\n"
+            "─────────\n"
+            "🔢 <b>ধাপ ৩: Transaction ID (TrxID)</b>\n"
+            "টাকা পাঠানোর পর আপনার পেমেন্টের <b>TrxID</b> নিচে লিখে পাঠান:",
             parse_mode="HTML",
             reply_markup=cancel_menu(),
         )
         return True
 
-    # 4. Deposit TrxID -> Save & Notify Admin
+    # Deposit Step 3 (TrxID) -> Step 4 (Submit for Admin Approval)
     if state == ST_DEP_TRXID:
-        method = context.user_data.get("dep_method", "bKash")
-        amt = float(context.user_data.get("dep_amount", 0))
-        trxid = text
-        context.user_data.clear()
-        with _db_lock, db() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO balance_requests (buyer_id, buyer_name, method, amount, trxid, status)
-                VALUES (?, ?, ?, ?, ?, 'pending')
-                """,
-                (user.id, user.first_name or "User", method, amt, trxid),
+        method = str(context.user_data.get("dep_method", "bKash Personal (Send Money)"))
+        amt = float(context.user_data.get("dep_amount", 0.0))
+        trxid = text.strip()
+        if len(trxid) < 2:
+            await update.message.reply_text(
+                "⚠️ সঠিক Transaction ID (TrxID) লিখে পাঠান:",
+                reply_markup=cancel_menu(),
             )
-            req_id = cur.lastrowid
-            conn.commit()
-
-        await update.message.reply_text(
-            "✅ <b>আপনার ডিপোজিট রিকোয়েস্ট জমা হয়েছে!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🧾 <b>Request ID:</b> <code>#DEP-{req_id}</code>\n"
-            f"🏦 <b>মেথড:</b> {method}\n"
-            f"💰 <b>পরিমাণ:</b> ৳{amt:.2f}\n"
-            f"🔢 <b>TrxID:</b> <code>{trxid}</code>\n"
-            "⏳ <b>স্ট্যাটাস:</b> Pending Verification\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "অ্যাডমিন যাচাই করার সাথে সাথে আপনার ওয়ালেটে অটোমেটিক ব্যালেন্স যোগ হয়ে যাবে!",
-            parse_mode="HTML",
-            reply_markup=main_menu(user.id),
-        )
-        aid = _admin_id()
-        if aid:
-            kb = InlineKeyboardMarkup(
+            return True
+        context.user_data["dep_trxid"] = trxid
+        context.user_data["state"] = ST_DEP_SUBMIT
+        kb = InlineKeyboardMarkup(
+            [
                 [
-                    [
-                        InlineKeyboardButton(
-                            "✅ Approve Balance", callback_data=f"approve_bal_{req_id}"
-                        ),
-                        InlineKeyboardButton(
-                            "❌ Reject", callback_data=f"reject_bal_{req_id}"
-                        ),
-                    ]
-                ]
-            )
-            try:
-                await context.bot.send_message(
-                    chat_id=aid,
-                    text=(
-                        "💳 <b>নতুন ডিপোজিট রিকোয়েস্ট এসেছে!</b>\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🧾 <b>Request ID:</b> #DEP-{req_id}\n"
-                        f"🏦 <b>মেথড:</b> {method}\n"
-                        f"💰 <b>পরিমাণ:</b> <b>৳{amt:.2f}</b>\n"
-                        f"🔢 <b>TrxID:</b> <code>{trxid}</code>\n"
-                        f"👤 <b>ইউজার:</b> {user.first_name} (<code>{user.id}</code>)"
-                    ),
-                    parse_mode="HTML",
-                    reply_markup=kb,
-                )
-            except Exception:
-                pass
+                    InlineKeyboardButton(
+                        "✅ ডিপোজিট সাবমিট করুন (Submit for Approval)",
+                        callback_data="dep_submit_cb",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ বাতিল করুন", callback_data="dep_cancel_cb"
+                    )
+                ],
+            ]
+        )
+        await update.message.reply_text(
+            "📤 <b>ধাপ ৪: ডিপোজিট সাবমিট কনফার্মেশন</b>\n"
+            "─────────\n"
+            f"🌸 <b>মেথড:</b> {method}\n"
+            f"💰 <b>পরিমাণ:</b> <b>৳{amt:.2f}</b>\n"
+            f"🔢 <b>TrxID:</b> <code>{trxid}</code>\n"
+            "─────────\n"
+            "👇 অ্যাডমিন অ্যাপ্রুভালের জন্য জমা দিতে নিচের বাটনে চাপুন:",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
         return True
 
     # 5. User Support Ticket -> Forward to Admin
@@ -4161,7 +4366,7 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    sell_price = calc_sell_price(s, qty)
+    _, _, sell_price = calc_vip_order_price(s, qty, user.id)
     panel_cost = calc_panel_cost(s, qty)
     bal = get_balance(user.id)
     if bal < sell_price:
@@ -4241,12 +4446,19 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ---------------------------------------------------------------------------
 ALL_MENU_BUTTONS = {
     BTN_NEW_ORDER,
+    "🚀 নতুন অর্ডার (SMM)",
+    "নতুন অর্ডার",
     BTN_MINIAPP,
     BTN_SERVICES,
+    "সার্ভিস লিস্ট",
     BTN_MY_ORDERS,
+    "আমার অর্ডার",
     BTN_DEPOSIT,
+    "ডিপোজিট",
     BTN_PROFILE,
+    "প্রোফাইল",
     BTN_REFER,
+    "রেফারেল",
     BTN_LEADERBOARD,
     BTN_MISSION,
     BTN_SUPPORT,
@@ -4287,27 +4499,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await show_main_dashboard(update, context)
         return
 
-    if text == BTN_NEW_ORDER:
+    if text in (BTN_NEW_ORDER, "🚀 নতুন অর্ডার (SMM)", "নতুন অর্ডার"):
         await show_categories(update, context)
         return
 
-    if text == BTN_SERVICES:
+    if text in (BTN_SERVICES, "সার্ভিস লিস্ট"):
         await show_all_services_list(update, context)
         return
 
-    if text == BTN_MY_ORDERS:
+    if text in (BTN_MY_ORDERS, "আমার অর্ডার"):
         await show_my_orders(update, context)
         return
 
-    if text == BTN_DEPOSIT:
+    if text in (BTN_DEPOSIT, "ডিপোজিট"):
         await start_deposit_flow(update, context)
         return
 
-    if text == BTN_PROFILE:
+    if text in (BTN_PROFILE, "প্রোফাইল"):
         await show_profile(update, context)
         return
 
-    if text == BTN_REFER:
+    if text in (BTN_REFER, "রেফারেল"):
         await show_referral(update, context)
         return
 
@@ -4387,7 +4599,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         if text == BTN_A_LIST:
-            await show_all_services_list(update, context)
+            await admin_show_all_services(update, context)
             return
 
         if text == BTN_A_DEL:
@@ -4500,7 +4712,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "VIP SMM Bot is Running 24/7 OK", 200
+    return "𝗧𝗿𝘂𝘀𝘁𝗩𝗮𝘂𝗹𝘁 SMM PANEL Bot is Running 24/7 OK", 200
 
 
 @app.route("/ping")
@@ -4650,7 +4862,7 @@ def main() -> None:
         )
     )
     application.add_handler(
-        CallbackQueryHandler(handle_deposit_method_cb, pattern="^dep_m_")
+        CallbackQueryHandler(handle_deposit_method_cb, pattern="^(dep_m_|dep_submit_cb$|dep_cancel_cb$)")
     )
     application.add_handler(
         CallbackQueryHandler(handle_claim_daily_cb, pattern="^claim_daily$")
@@ -4677,7 +4889,7 @@ def main() -> None:
     )
     application.add_error_handler(error_handler)
 
-    logger.info("VIP BIG SMM Panel Bot is running...")
+    logger.info("TrustVault SMM PANEL Bot is running...")
     application.run_polling(close_loop=False, drop_pending_updates=True)
 
 
